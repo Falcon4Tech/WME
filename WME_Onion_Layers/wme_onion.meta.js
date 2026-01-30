@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                                     WME Onion Layers
 // @name:pl                                     WME Cebula
-// @version                                       Alpha.4
+// @version                                       Alpha.5
 // @tag                                            WME
 // @description                 Adds Polish WMS overlays from e-mapa.net to WME (works only in Poland territory).
 // @description:pl              Cebula ma warstwy, WME ma WMSy! Dodaje polskie nakładki WMS z e-mapa.net do WME.

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                                     WME Onion Layers
 // @name:pl                                     WME Cebula
-// @version                                       Alpha.4
+// @version                                       Alpha.5
 // @tag                                            WME
 // @description                 Adds Polish WMS overlays from e-mapa.net to WME (works only in Poland territory).
 // @description:pl              Cebula ma warstwy, WME ma WMSy! Dodaje polskie nakładki WMS z e-mapa.net do WME.
@@ -257,63 +257,11 @@
       menuRoot.appendChild(liGroup);
     }
 
-    // Ochrona przed "phantom toggle" web-componentu.
-    let allowPersist = false;
-    let userInteracted = false;
-
-    // Oznacz realną intencję użytkownika
-    groupSwitch.addEventListener('pointerdown', () => { userInteracted = true; }, true);
-    groupSwitch.addEventListener('mousedown', () => { userInteracted = true; }, true);
-    groupSwitch.addEventListener('touchstart', () => { userInteracted = true; }, true);
-
-    // W niektórych buildach realna interakcja zachodzi na wewnętrznym input
-    const markShadowInput = () => {
-      try {
-        const sr = groupSwitch.shadowRoot;
-        if (!sr) return false;
-        const input = sr.querySelector('input[type="checkbox"]');
-        if (!input) return false;
-        if (input.__geoMarkWired) return true;
-        input.__geoMarkWired = true;
-        input.addEventListener('pointerdown', () => { userInteracted = true; }, true);
-        input.addEventListener('mousedown', () => { userInteracted = true; }, true);
-        input.addEventListener('touchstart', () => { userInteracted = true; }, true);
-        return true;
-      } catch (e) {
-        return false;
-      }
-    };
-
-    if (!markShadowInput()) {
-      let tries = 0;
-      const t = setInterval(() => {
-        tries += 1;
-        if (markShadowInput() || tries > 20) clearInterval(t);
-      }, 250);
-    }
-
-    // Po krótkim czasie możemy bezpiecznie zapisywać zmiany,
-    // nawet jeśli użytkownik jeszcze nie kliknął.
-    setTimeout(() => { allowPersist = true; }, 1200);
-
     wireToggleSwitch(groupSwitch, (enabled) => {
-      const stored = getGroupEnabled(true);
-
-      // Jeśli nie było jeszcze interakcji użytkownika, a jesteśmy w oknie hydracji,
-      // traktuj pierwszy toggle jako fantom: przywróć stan i nie zapisuj.
-      if (!userInteracted && !allowPersist && enabled !== stored) {
-        setSwitchChecked(groupSwitch, stored);
-        applyGroupEnabledUI(stored);
-        applyGroupState();
-        return;
-      }
-
       setGroupEnabled(enabled);
 
       // UX: po włączeniu grupy automatycznie ją rozwiń.
-      if (enabled) {
-        setGroupCollapsed(false);
-      }
+      if (enabled) setGroupCollapsed(false);
 
       applyGroupEnabledUI(enabled);
       applyGroupState();
@@ -331,45 +279,18 @@
   // --- Helpery dla wz-toggle-switch / wz-checkbox ---
   function getSwitchChecked(el) {
     if (!el) return true;
-
-    // Preferuj realny stan wewnętrzny, jeśli jest dostępny
-    try {
-      if (el.shadowRoot) {
-        const span = el.shadowRoot.querySelector('span.wz-toggle-switch');
-        if (span) return span.classList.contains('checked');
-        const input = el.shadowRoot.querySelector('input[type="checkbox"]');
-        if (input) return !!input.checked;
-      }
-    } catch (e) {
-      // ignoruj
-    }
-
-    // Ścieżki awaryjne
     if (typeof el.checked === 'boolean') return !!el.checked;
     return el.hasAttribute('checked');
   }
 
-  // Ustawianie w trybie najlepszej próby dla wz-toggle-switch.
-  // Używamy tego tylko do synchronizacji STANU POCZĄTKOWEGO.
   function setSwitchChecked(el, checked) {
     if (!el) return;
+    // większość buildów reaguje na atrybut `checked`
     if (checked) el.setAttribute('checked', '');
     else el.removeAttribute('checked');
 
-    // Spróbuj zsynchronizować wewnętrzny checkbox, jeśli jest shadowRoot.
-    try {
-      if (el.shadowRoot) {
-        const input = el.shadowRoot.querySelector('input[type="checkbox"]');
-        if (input) input.checked = !!checked;
-        const span = el.shadowRoot.querySelector('span.wz-toggle-switch');
-        if (span) {
-          if (checked) span.classList.add('checked');
-          else span.classList.remove('checked');
-        }
-      }
-    } catch (e) {
-      // ignoruj
-    }
+    // część buildów ma też property `checked`
+    try { el.checked = !!checked; } catch (e) { /* ignore */ }
   }
 
   function setCheckboxDisabled(el, disabled) {
@@ -377,9 +298,6 @@
     if (disabled) el.setAttribute('disabled', '');
     else el.removeAttribute('disabled');
   }
-  // Zapewnij, że wz-toggle-switch wywoła handler w różnych buildach WME.
-  // Niektóre wersje nie emitują użytecznego `change` z hosta,
-  // więc nasłuchujemy też wewnętrznego <input type="checkbox">.
   function wireToggleSwitch(toggleEl, onToggle) {
     if (!toggleEl) return;
 
@@ -391,66 +309,13 @@
       }
     };
 
-    // Zdarzenia na hoście (na ile się da)
-    toggleEl.addEventListener('change', fire);
-    toggleEl.addEventListener('click', () => {
-      // Klik może zmienić stan po wywołaniu handlera; odrocz.
-      setTimeout(fire, 0);
-    });
-
-    // Zdarzenia shadow input
-    const tryWireShadowInput = () => {
-      try {
-        const sr = toggleEl.shadowRoot;
-        if (!sr) return false;
-        const input = sr.querySelector('input[type="checkbox"]');
-        if (!input) return false;
-
-        // Uniknij podwójnego podpinania
-        if (input.__geoWired) return true;
-        input.__geoWired = true;
-
-        input.addEventListener('change', () => setTimeout(fire, 0));
-        input.addEventListener('click', () => setTimeout(fire, 0));
-        return true;
-      } catch (e) {
-        return false;
-      }
-    };
-
-    if (tryWireShadowInput()) return;
-
-    // Shadow root może pojawić się chwilę później; spróbuj ponownie za chwilę.
-    let tries = 0;
-    const t = setInterval(() => {
-      tries += 1;
-      if (tryWireShadowInput() || tries > 20) clearInterval(t);
-    }, 250);
+    // Minimal: host events only
+    toggleEl.addEventListener('change', () => setTimeout(fire, 0));
+    toggleEl.addEventListener('click', () => setTimeout(fire, 0));
   }
 
   function applyGroupState() {
     const groupEnabled = getGroupEnabled(true);
-
-    // Odzwierciedl zachowanie natywne:
-    // - gdy grupa WYŁ.: wymuszone zwinięcie + strzałka do góry
-    // - gdy grupa WŁ.: nie wymuszaj zwinięcia (kontroluje użytkownik)
-    if (UI.groupSwitch) {
-      const groupLi = UI.groupSwitch.closest('li.group');
-      const ul = groupLi?.querySelector('ul');
-      const caretIcon = groupLi?.querySelector('i.toggle-category');
-      const collapsed = !groupEnabled ? true : (ul ? ul.classList.contains('collapse-layer-switcher-group') : false);
-
-      if (ul) {
-        if (!groupEnabled) ul.classList.add('collapse-layer-switcher-group');
-        // jeśli włączone: nie ruszaj klas ul
-      }
-
-      if (caretIcon) {
-        caretIcon.className = collapsed
-          ? 'toggle-category w-icon w-icon-caret-down upside-down'
-          : 'toggle-category w-icon w-icon-caret-down';
-      }
-    }
 
     for (const item of UI.layerItems) {
       const wanted = getLayerEnabled(item.def.id, item.def.defaultOn);
