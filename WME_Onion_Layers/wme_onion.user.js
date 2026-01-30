@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                                     WME Onion Layers
 // @name:pl                                     WME Cebula
-// @version                                       Alpha.3
+// @version                                       Alpha.4
 // @tag                                            WME
 // @description                 Adds Polish WMS overlays from e-mapa.net to WME (works only in Poland territory).
 // @description:pl              Cebula ma warstwy, WME ma WMSy! Dodaje polskie nakładki WMS z e-mapa.net do WME.
@@ -31,14 +31,10 @@
     layerItems: [] // { def, layer, checkbox }
   };
 
-  // EPSG:2180 (PUWG 1992)
-  const EPSG2180_DEF =
-    '+proj=tmerc +lat_0=0 +lon_0=19 +k=0.9993 ' +
-    '+x_0=500000 +y_0=-5300000 +ellps=GRS80 +units=m +no_defs';
 
   // === Konfiguracja warstw ===
   // Opcjonalnie per warstwa:
-  //   requestSrs: 'EPSG:900913' | 'EPSG:3857' | 'EPSG:4326' | 'EPSG:2180'
+  //   requestSrs: 'EPSG:900913' | 'EPSG:3857' | 'EPSG:4326'
   const LAYERS = [
     {
       id: 'opp',
@@ -164,45 +160,6 @@
     tick();
   }
 
-  // ---------- Inicjalizacja proj4 ----------
-  function ensureProj4Available(timeoutMs = 8000) {
-    const has = () => !!(window.Proj4js || window.proj4);
-    if (has()) return Promise.resolve(true);
-
-    // Próba dociągnięcia Proj4js
-    return new Promise((resolve) => {
-      const s = document.createElement('script');
-      s.async = true;
-      s.onload = () => resolve(has());
-      s.onerror = () => resolve(false);
-
-      // Proj4js 1.1.0 combined (ustawia window.Proj4js)
-      s.src = 'https://cdnjs.cloudflare.com/ajax/libs/proj4js/1.1.0/proj4js-compressed.js';
-      document.head.appendChild(s);
-
-      setTimeout(() => resolve(has()), timeoutMs);
-    });
-  }
-
-  function defineEpsg2180() {
-    try {
-      // Preferowane dla OpenLayers 2
-      if (window.Proj4js && window.Proj4js.defs) {
-        window.Proj4js.defs['EPSG:2180'] = EPSG2180_DEF;
-        return true;
-      }
-
-      // Alternatywnie, gdy dostępny jest tylko proj4 2.x
-      if (window.proj4 && typeof window.proj4.defs === 'function') {
-        window.proj4.defs('EPSG:2180', EPSG2180_DEF);
-        return true;
-      }
-
-      return false;
-    } catch (e) {
-      return false;
-    }
-  }
 
   function getLayerSwitcherUL() {
     // Główna lista z grupami: <ul class="list-unstyled togglers">
@@ -549,56 +506,17 @@
     const mapProj = this.map.getProjectionObject();
     const mapCode = mapProj?.getCode ? mapProj.getCode() : 'EPSG:900913';
 
-    // Żądany SRS dla serwera WMS (domyślnie: projekcja mapy)
-    const reqSrs = this.requestSrs || this.params.SRS || 'EPSG:2180';
+    // Żądany SRS dla serwera WMS (domyślnie: taki jak mapa)
+    const reqSrs = this.requestSrs || this.params.SRS || mapCode;
 
-    // EPSG:4326 działa poprawnie dla tych endpointów w WME.
-    if (reqSrs !== mapCode && reqSrs !== 'EPSG:4326') {
-      log('WARNING: WMS requested in', reqSrs, 'but map is', mapCode, '- raster may be misaligned.');
-    }
-
-    // BBOX liczymy z granic mapy i (jeśli trzeba) transformujemy tylko do requestu.
-    const reqProj = new window.OpenLayers.Projection(reqSrs);
-
-    const before = bounds.toArray(false);
-    try {
-      // Transformuj granice TYLKO na potrzeby requestu BBOX
-      bounds.transform(mapProj, reqProj);
-    } catch (e) {
-      // ignoruj; spróbuj ręcznej transformacji
-    }
-
-    const after = bounds.toArray(false);
-    const almostSame = (a, b) => Math.abs(a - b) < 1;
-    const unchanged = almostSame(before[0], after[0]) && almostSame(before[1], after[1]) && almostSame(before[2], after[2]) && almostSame(before[3], after[3]);
-
-    if (unchanged && reqSrs !== mapCode) {
-      // Jeśli transformacja OL2 nie zadziałała (problem z proj4), spróbuj ręcznej dla requestu BBOX.
-      const x1 = before[0], y1 = before[1], x2 = before[2], y2 = before[3];
-
-      const project = (x, y) => {
-        // Preferuj Proj4js 1.x
-        if (window.Proj4js && window.Proj4js.Proj && window.Proj4js.transform) {
-          const src = new window.Proj4js.Proj(mapCode);
-          const dst = new window.Proj4js.Proj(reqSrs);
-          const p = new window.Proj4js.Point(x, y);
-          window.Proj4js.transform(src, dst, p);
-          return [p.x, p.y];
-        }
-        // Alternatywnie: proj4 2.x
-        if (window.proj4) {
-          const out = window.proj4(mapCode, reqSrs, [x, y]);
-          return [out[0], out[1]];
-        }
-        return [x, y];
-      };
-
-      const p1 = project(x1, y1);
-      const p2 = project(x2, y2);
-      bounds.left = Math.min(p1[0], p2[0]);
-      bounds.bottom = Math.min(p1[1], p2[1]);
-      bounds.right = Math.max(p1[0], p2[0]);
-      bounds.top = Math.max(p1[1], p2[1]);
+    // Transformuj BBOX tylko na potrzeby requestu
+    if (reqSrs !== mapCode) {
+      try {
+        const reqProj = new window.OpenLayers.Projection(reqSrs);
+        bounds.transform(mapProj, reqProj);
+      } catch (e) {
+        // jeśli transformacja nie jest dostępna, zostaw BBOX w projekcji mapy
+      }
     }
 
     newParams.BBOX = bounds.toArray(false);
@@ -620,7 +538,7 @@
   function buildWmsLayer(def, mapSrs) {
     const params = Object.assign({}, def.params);
 
-    // Request SRS: domyślnie projekcja mapy WME dla poprawnego rastra.
+    // Request SRS: domyślnie projekcja mapy WME.
     const requestSrs = def.requestSrs || mapSrs;
     params.SRS = requestSrs;
 
@@ -703,23 +621,7 @@
     }
   }
 
-  whenWmeReady(async () => {
-    const ok = await ensureProj4Available();
-    if (!ok) {
-      log('Proj4 not available (likely CSP blocked).');
-      return;
-    }
-    if (!defineEpsg2180()) {
-      log('Could not define EPSG:2180 in proj4/Proj4js.');
-      return;
-    }
-
-    try {
-      new window.OpenLayers.Projection('EPSG:2180');
-    } catch (e) {
-      // ignoruj
-    }
-
+  whenWmeReady(() => {
     initBootstrap();
   });
 
