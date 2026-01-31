@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name                                     WME Onion Layers
 // @name:pl                                     WME Cebula
-// @version                                       Alpha.5
+// @version                                       Beta.1
 // @tag                                            WME
 // @description                 Adds Polish WMS overlays from e-mapa.net to WME (works only in Poland territory).
 // @description:pl              Cebula ma warstwy, WME ma WMSy! Dodaje polskie nakładki WMS z e-mapa.net do WME.
-// @grant             none
+// @grant             GM_xmlhttpRequest
+// @connect           cdn.jsdelivr.net
 // @author            Falcon4Tech
 // @run-at            document-idle
 // @namespace         https://wazepolska.pl
@@ -20,24 +21,31 @@
 (function () {
   'use strict';
 
+  const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
   const SCRIPT_KEY = 'WME_Onion_Layers';
   const SCRIPT_NAME = 'WME Cebula';
+
+  const DATA_BASE_URL = `https://cdn.jsdelivr.net/gh/Falcon4Tech/WME@main/${SCRIPT_KEY}/data/`;
 
   const log = (...a) => console.log(`🗺️ ${SCRIPT_NAME}`, ...a);
 
   // Referencje do UI w runtime
   const UI = {
     groupSwitch: null,
-    layerItems: [] // { def, layer, checkbox }
+    layerItems: [], // { def, layer, checkbox }
+    runtimeLayers: {} // { [id]: boolean } – dla warstw z saveState:false
   };
 
 
   // === Konfiguracja warstw ===
   // Opcjonalnie per warstwa:
   //   requestSrs: 'EPSG:900913' | 'EPSG:3857' | 'EPSG:4326'
+  //   saveState: true|false  (domyślnie true; false = brak zapisu do localStorage)
   const LAYERS = [
     {
       id: 'opp',
+      type: 'wms',
       name: 'OPP - fotoradary',
       url: 'https://wms.e-mapa.net/cgi-bin/mapserv7',
       version: '1.1.1',
@@ -53,6 +61,7 @@
     },
     {
       id: 'granice',
+      type: 'wms',
       name: 'Granice - obręby',
       url: 'https://granice.e-mapa.net/cgi-bin/granice_prg',
       version: '1.1.1',
@@ -67,6 +76,7 @@
     },
     {
       id: 'miasta',
+      type: 'wms',
       name: 'Miasta',
       url: 'https://granice.e-mapa.net/cgi-bin/mapserv',
       version: '1.1.1',
@@ -79,6 +89,34 @@
         styles: ''
       },
       defaultOn: false
+    }
+    ,{
+      id: 'sct-warszawa',
+      type: 'geojson',
+      name: 'SCT – Warszawa',
+      defaultOn: false,
+      saveState: false,
+      style: {
+        strokeColor: '#ff0000',
+        strokeWidth: 3,
+        strokeOpacity: 0.9,
+        fillColor: '#ff0000',
+        fillOpacity: 0.15
+      }
+    }
+    ,{
+      id: 'sct-krakow',
+      type: 'geojson',
+      name: 'SCT – Kraków',
+      defaultOn: false,
+      saveState: false,
+      style: {
+        strokeColor: '#ff0000',
+        strokeWidth: 3,
+        strokeOpacity: 0.9,
+        fillColor: '#ff0000',
+        fillOpacity: 0.15
+      }
     }
   ];
 
@@ -109,17 +147,37 @@
     localStorage.setItem(SCRIPT_KEY, JSON.stringify(next));
   }
 
-  function getLayerEnabled(id, fallback) {
-    const st = readState();
-    const v = st.layers?.[id];
-    if (typeof v === 'boolean') return v;
-    return !!fallback;
+  function shouldSaveLayerState(def) {
+    return def?.saveState !== false;
   }
 
-  function setLayerEnabled(id, enabled) {
+  function getWantedLayerState(def) {
+    if (!def) return false;
+
+    // Warstwy "sesyjne" (bez zapisu do localStorage)
+    if (!shouldSaveLayerState(def)) {
+      if (typeof UI.runtimeLayers[def.id] === 'boolean') return UI.runtimeLayers[def.id];
+      return !!def.defaultOn;
+    }
+
+    // Warstwy zapisywane w localStorage
+    const st = readState();
+    const v = st.layers?.[def.id];
+    if (typeof v === 'boolean') return v;
+    return !!def.defaultOn;
+  }
+
+  function setWantedLayerState(def, enabled) {
+    if (!def) return;
+
+    if (!shouldSaveLayerState(def)) {
+      UI.runtimeLayers[def.id] = !!enabled;
+      return;
+    }
+
     const st = readState();
     st.layers = st.layers || {};
-    st.layers[id] = !!enabled;
+    st.layers[def.id] = !!enabled;
     writeState(st);
   }
 
@@ -151,7 +209,7 @@
   function whenWmeReady(cb) {
     const tick = () => {
       try {
-        if (window.W && window.W.map && window.OpenLayers) cb();
+        if (UW.W && UW.W.map && UW.OpenLayers) cb();
         else setTimeout(tick, 800);
       } catch (e) {
         setTimeout(tick, 800);
@@ -318,11 +376,16 @@
     const groupEnabled = getGroupEnabled(true);
 
     for (const item of UI.layerItems) {
-      const wanted = getLayerEnabled(item.def.id, item.def.defaultOn);
+      const wanted = getWantedLayerState(item.def);
 
       // Nie nadpisuj wyboru użytkownika dla warstwy, gdy grupa jest wyłączona.
       // Tylko wymuszamy niewidoczność na czas wyłączenia grupy.
       const effective = groupEnabled && wanted;
+      // Lazy-load GeoJSON kiedy ma się stać widoczny
+      if (effective && item.def.type === 'geojson') {
+        // fire-and-forget (nie blokuj UI)
+        ensureGeoJsonLoaded(item);
+      }
       item.layer.setVisibility(!!effective);
 
       // Wyłącz checkboxy warstw, gdy grupa jest wyłączona (zachowaj ich stan)
@@ -335,7 +398,7 @@
   }
 
 
-  function addToggleRow(ul, layer, id, defaultChecked) {
+  function addToggleRow(ul, layer, def, defaultChecked) {
     const li = document.createElement('li');
 
     const wrap = document.createElement('div');
@@ -347,10 +410,16 @@
     // Checkbox odzwierciedla zapisany wybór dla danej warstwy.
     chk.checked = !!defaultChecked;
 
-    chk.addEventListener('change', (e) => {
+    chk.addEventListener('change', async (e) => {
       const enabled = !!e.target.checked;
-      // Zapisz wybór użytkownika i przelicz widoczność warstw.
-      setLayerEnabled(id, enabled);
+      setWantedLayerState(def, enabled);
+
+      // Dla GeoJSON dociągnij dane dopiero przy włączeniu.
+      const item = UI.layerItems.find((x) => x.def.id === def.id);
+      if (enabled && item && item.def.type === 'geojson') {
+        await ensureGeoJsonLoaded(item);
+      }
+
       applyGroupState();
     });
 
@@ -358,6 +427,87 @@
     li.appendChild(wrap);
     ul.appendChild(li);
     return chk;
+  }
+
+  // ---------- GeoJSON (jsDelivr) ----------
+  function httpGetText(url) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest !== 'function') {
+        reject(new Error('GM_xmlhttpRequest niedostępny (brak @grant lub menedżera userscriptów)'));
+        return;
+      }
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        onload: (res) => {
+          if (res.status >= 200 && res.status < 300) resolve(res.responseText);
+          else reject(new Error(`HTTP ${res.status} dla ${url}`));
+        },
+        onerror: () => reject(new Error(`Błąd sieci dla ${url}`))
+      });
+    });
+  }
+
+  function buildVectorLayer(def, mapProj) {
+    const style = def.style || {};
+    const styleMap = new UW.OpenLayers.StyleMap({
+      'default': new UW.OpenLayers.Style({
+        strokeColor: style.strokeColor || '#ff0000',
+        strokeWidth: style.strokeWidth ?? 3,
+        strokeOpacity: style.strokeOpacity ?? 0.9,
+        fillColor: style.fillColor || '#ff0000',
+        fillOpacity: style.fillOpacity ?? 0.15
+      })
+    });
+
+    const layer = new UW.OpenLayers.Layer.Vector(def.name, {
+      styleMap,
+      visibility: false
+    });
+
+    // Wewnętrzne flagi runtime
+    layer.__onion = {
+      type: 'geojson',
+      loaded: false,
+      loading: false
+    };
+
+    return layer;
+  }
+
+  async function ensureGeoJsonLoaded(item) {
+    const layer = item.layer;
+    const rt = layer.__onion;
+    if (!rt || rt.loaded || rt.loading) return;
+
+    rt.loading = true;
+    const url = `${DATA_BASE_URL}${item.def.id}.${item.def.type}`;
+
+    try {
+      const text = await httpGetText(url);
+      const geo = JSON.parse(text);
+
+      const fmt = new UW.OpenLayers.Format.GeoJSON({
+        externalProjection: new UW.OpenLayers.Projection('EPSG:4326'),
+        internalProjection: UW.W.map.getProjectionObject()
+      });
+
+      const features = fmt.read(geo);
+      if (features && features.length) {
+        layer.addFeatures(features);
+      } else {
+        log('GeoJSON bez obiektów:', item.def.id);
+      }
+
+      rt.loaded = true;
+    } catch (e) {
+      log('Błąd ładowania GeoJSON:', item.def.id, e);
+      // Jeśli nie udało się załadować, wyłącz warstwę w stanie użytkownika.
+      setWantedLayerState(item.def, false);
+      if (item.checkbox) item.checkbox.checked = false;
+    } finally {
+      rt.loading = false;
+    }
   }
 
   // ---------- Budowanie requestów WMS (1.1.1) ----------
@@ -377,7 +527,7 @@
     // Transformuj BBOX tylko na potrzeby requestu
     if (reqSrs !== mapCode) {
       try {
-        const reqProj = new window.OpenLayers.Projection(reqSrs);
+        const reqProj = new UW.OpenLayers.Projection(reqSrs);
         bounds.transform(mapProj, reqProj);
       } catch (e) {
         // jeśli transformacja nie jest dostępna, zostaw BBOX w projekcji mapy
@@ -396,7 +546,7 @@
     const srs = this.requestSrs || this.params.SRS;
     if (srs) this.params.SRS = srs;
     if (this.params.CRS) delete this.params.CRS;
-    return window.OpenLayers.Layer.Grid.prototype.getFullRequestString.apply(this, arguments);
+    return UW.OpenLayers.Layer.Grid.prototype.getFullRequestString.apply(this, arguments);
   }
 
   // ---------- Tworzenie warstw ----------
@@ -418,11 +568,11 @@
 
     // UWAGA: OpenLayers dopisze SERVICE/REQUEST/VERSION itd.
     // Polegamy na nadpisaniu getFullRequestString, aby wymusić SRS.
-    const layer = new window.OpenLayers.Layer.WMS(def.name, def.url, params, {
+    const layer = new UW.OpenLayers.Layer.WMS(def.name, def.url, params, {
       isBaseLayer: false,
       visibility: false,
       singleTile: false,
-      tileSize: new window.OpenLayers.Size(1600, 1600),
+      tileSize: new UW.OpenLayers.Size(1600, 1600),
       buffer: 0,
       transitionEffect: null,
       getURL: getUrlAsWms111,
@@ -433,7 +583,7 @@
   }
 
   function init() {
-    const map = window.W.map;
+    const map = UW.W.map;
 
     // Bez duplikatów
     const already = map.getLayersByName(LAYERS[0].name);
@@ -451,14 +601,25 @@
     const mapSrs = map.getProjectionObject()?.getCode ? map.getProjectionObject().getCode() : 'EPSG:900913';
 
     for (const def of LAYERS) {
-      const enabled = getLayerEnabled(def.id, def.defaultOn);
-      const layer = buildWmsLayer(def, mapSrs);
+      const enabled = getWantedLayerState(def);
+
+      let layer;
+      if (def.type === 'geojson') {
+        layer = buildVectorLayer(def, map.getProjectionObject());
+      } else {
+        layer = buildWmsLayer(def, mapSrs);
+      }
+
       map.addLayer(layer);
-      // Z-index wyżej niż standardowe warstwy WME.
       layer.setZIndex(2050);
 
-      const checkbox = addToggleRow(ul, layer, def.id, enabled);
+      const checkbox = addToggleRow(ul, layer, def, enabled);
       UI.layerItems.push({ def, layer, checkbox });
+
+      // Jeśli warstwa GeoJSON była już włączona w stanie, spróbuj ją dociągnąć od razu.
+      if (enabled && def.type === 'geojson') {
+        ensureGeoJsonLoaded(UI.layerItems[UI.layerItems.length - 1]);
+      }
     }
 
     // Zastosuj stan grupy nadrzędnej (odświeża też checkboxy warstw)
