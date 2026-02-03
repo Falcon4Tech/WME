@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name                                     WME Node Finder
-// @version                                       2602.3
+// @version                                       2602.6
 // @tag                                            WME
 // @description       [Only for Poland] Tab in Scripts with a search engine for GDDKiA road nodes and border crossings.
 // @description:pl    Zakładka w Scripts (WME SDK) z wyszukiwarką węzłów drogowych GDDKiA i przejść granicznych.

@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name                                     WME Node Finder
-// @version                                       2602.3
+// @version                                       2602.6
 // @tag                                            WME
 // @description       [Only for Poland] Tab in Scripts with a search engine for GDDKiA road nodes and border crossings.
 // @description:pl    Zakładka w Scripts (WME SDK) z wyszukiwarką węzłów drogowych GDDKiA i przejść granicznych.
@@ -63,7 +63,7 @@
   const MSG_SOURCE = "WME_PL_GDDKIA_JUNCTIONS";
 
   // Debug logs (set to false to silence)
-  const DEBUG = false;
+  const DEBUG = true;
   const log = (...args) => {
     if (DEBUG) console.log(`[${SCRIPT_NAME}]`, ...args);
   };
@@ -258,10 +258,13 @@
           .\${SCRIPT_ID}__grid3 { display: grid; grid-template-columns: 1fr; gap: 8px; }
           .\${SCRIPT_ID}__field label { display:block; font-size: 12px; opacity: .85; margin-bottom: 2px; }
           .\${SCRIPT_ID}__field input { width: 100%; }
+          .\${SCRIPT_ID}__field input[type="checkbox"] { width: auto; }
+          .\${SCRIPT_ID}__field label.\${SCRIPT_ID}__inline { display:flex; align-items:self-start; gap: 6px; }
           .\${SCRIPT_ID}__bar { display:flex; gap: 8px; align-items:center; margin: 8px 0; }
           .\${SCRIPT_ID}__meta { margin: 6px 0; font-size: 12px; opacity: .85; }
           .\${SCRIPT_ID}__list { display:flex; flex-direction:column; gap: 6px; }
           .\${SCRIPT_ID}__row { display:flex; justify-content:space-between; gap: 8px; padding: 8px; border-radius: 8px; background: rgba(0,0,0,.04); }
+          .\${SCRIPT_ID}__row--active { background: rgba(74,140,202,.18); box-shadow: inset 0 0 0 1px rgba(74,140,202,.5); }
           .\${SCRIPT_ID}__title { line-height: 1.2; }
           .\${SCRIPT_ID}__sub { font-size: 12px; opacity: .85; }
           .\${SCRIPT_ID}__right { display:flex; align-items:center; }
@@ -274,6 +277,7 @@
           .\${SCRIPT_ID}__grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
           .\${SCRIPT_ID}__grid2 .\${SCRIPT_ID}__field { min-width: 0; }
           .\${SCRIPT_ID}__grid2 .\${SCRIPT_ID}__field--full { grid-column: 1 / -1; }
+          .\${SCRIPT_ID}__field--actions { display:flex; justify-content:flex-end; gap: 10px; align-items:center; width: 100%; }
           .\${SCRIPT_ID}__border-row { display:grid; grid-template-columns: 1fr auto; gap: 8px; }
           .\${SCRIPT_ID}__border-top { display:flex; flex-direction:column; gap: 2px; }
           .\${SCRIPT_ID}__border-bottom { grid-column: 1 / -1; display:flex; flex-direction:column; gap: 2px; }
@@ -309,14 +313,157 @@
       function applyBorderFilters(filters) {
         const fNeighbor = norm(filters.neighbor);
         const fGeo = norm(filters.geographical_border);
-        const fName = norm(filters.name);
+        const rawName = String(filters.name ?? "").trim();
+        const hasWildcard = rawName === "*";
+        const fName = hasWildcard ? "" : norm(rawName);
+        const onlyClosed = Boolean(filters.onlyClosed);
 
         return dataBorders.filter((b) => {
           if (fNeighbor && !norm(b.neighbor).includes(fNeighbor)) return false;
           if (fGeo && !norm(b.geographical_border).includes(fGeo)) return false;
           if (fName && !norm(b.name_border_crossing).includes(fName)) return false;
+          if (onlyClosed) {
+            const closedCheck = String(b.limitations ?? "") + " " + String(b.other ?? "");
+            if (!/przejście\\s+zamknięte/i.test(closedCheck)) return false;
+          }
           return true;
         });
+      }
+
+      let venueGetter = null;
+      function getVenueById(venueId) {
+        if (!venueGetter) {
+          if (sdk?.DataModel?.Venues?.getById) {
+            venueGetter = (id) => sdk.DataModel.Venues.getById({ venueId: id });
+          } else if (sdk?.Venues?.getById) {
+            venueGetter = (id) => sdk.Venues.getById({ venueId: id });
+          } else if (sdk?.venues?.getById) {
+            venueGetter = (id) => sdk.venues.getById({ venueId: id });
+          } else {
+            return null;
+          }
+        }
+        return venueGetter(venueId);
+      }
+
+      let selectionGetterLogged = false;
+      function getSelectionSafe() {
+        if (!sdk?.Editing?.getSelection) {
+          if (!selectionGetterLogged) {
+            console.warn("[" + SCRIPT_NAME + "] getSelection not available on SDK");
+            selectionGetterLogged = true;
+          }
+          return null;
+        }
+        if (!selectionGetterLogged) {
+          selectionGetterLogged = true;
+        }
+        return sdk.Editing.getSelection();
+      }
+
+      function getSelectedVenueId() {
+        const sel = getSelectionSafe();
+        if (!sel || !sel.ids || sel.ids.length === 0) return null;
+        const type = sel.objectType;
+        const typeStr = typeof type === "string" ? type.toUpperCase() : "";
+        const isVenue = typeStr === "VENUE" ||
+          type === sdk?.DataModel?.VENUE ||
+          type === sdk?.Objects?.VENUE ||
+          type === sdk?.Selection?.VENUE ||
+          type === sdk?.VENUE;
+        if (!isVenue) return null;
+        return String(sel.ids[0]);
+      }
+
+      function getSelectedVenueInfo() {
+        const venueId = getSelectedVenueId();
+        if (!venueId) return null;
+        const venue = getVenueById(venueId);
+        if (!venue) return { venueId, venue: null, categories: null, isJunction: false };
+        const categories = Array.isArray(venue.categories) ? venue.categories : [];
+        const isJunction = categories.some((c) => String(c).toUpperCase() === "JUNCTION_INTERCHANGE");
+        return { venueId, venue, categories, isJunction };
+      }
+
+      function canInsertIntoSelectedVenue() {
+        const info = getSelectedVenueInfo();
+        if (!info || !info.isJunction) return null;
+        if (sdk?.Editing?.isEditingAllowed && !sdk.Editing.isEditingAllowed()) return null;
+        return info;
+      }
+
+      function insertJunctionName(name) {
+        const info = canInsertIntoSelectedVenue();
+        if (!info) {
+          console.log("[" + SCRIPT_NAME + "] insertJunctionName: no venue or not allowed");
+          return false;
+        }
+        const cleanName = String(name ?? "").trim();
+        const label = "↗ " + cleanName;
+        const venuesModel = sdk?.DataModel?.Venues;
+        const update = venuesModel?.updateVenue;
+        if (typeof update !== "function") {
+          console.log("[" + SCRIPT_NAME + "] insertJunctionName: sdk.DataModel.Venues.updateVenue not available");
+          return false;
+        }
+        if (!info.venue) {
+          console.log("[" + SCRIPT_NAME + "] insertJunctionName: venue missing");
+          return false;
+        }
+        const payload = { venueId: info.venueId, name: label, aliases: ["węzeł " + cleanName] };
+        const v = info.venue;
+        if (v && v.lockRank !== 3) payload.lockRank = 3;
+        try {
+          const res = update.call(venuesModel, payload);
+          console.log("[" + SCRIPT_NAME + "] insertJunctionName: updated", { venueId: info.venueId, name: label, res, updateName: "sdk.DataModel.Venues.updateVenue" });
+          return true;
+        } catch (e) {
+          console.warn("[" + SCRIPT_NAME + "] insertJunctionName: update failed", e);
+        }
+        return false;
+      }
+
+      let lastJunctionState = "";
+      let delayedVenueCheckTimer = null;
+      let delayedVenueCheckId = "";
+      const DELAYED_VENUE_CHECK_MS = 200;
+      function updateJunctionButtons() {
+        const info = getSelectedVenueInfo();
+        const editingAllowed = !(sdk?.Editing?.isEditingAllowed) || sdk.Editing.isEditingAllowed();
+        const canInsert = Boolean(info && info.isJunction && editingAllowed);
+        const stateKey = JSON.stringify({
+          canInsert,
+          venueId: info ? info.venueId : null,
+          isJunction: info ? info.isJunction : false,
+          editingAllowed,
+        });
+        if (stateKey !== lastJunctionState) {
+          lastJunctionState = stateKey;
+          console.log("[" + SCRIPT_NAME + "] junction button state", {
+            canInsert,
+            venueId: info ? info.venueId : null,
+            isJunction: info ? info.isJunction : false,
+            editingAllowed,
+            categories: info ? info.categories : null,
+          });
+        }
+        if (info && info.venueId && !info.venue) {
+          if (delayedVenueCheckId !== info.venueId) {
+            delayedVenueCheckId = info.venueId;
+            if (delayedVenueCheckTimer) clearTimeout(delayedVenueCheckTimer);
+            delayedVenueCheckTimer = setTimeout(() => {
+              delayedVenueCheckTimer = null;
+              updateJunctionButtons();
+            }, DELAYED_VENUE_CHECK_MS);
+          }
+        }
+        const text = canInsert ? "↪︎" : "Centruj";
+        const mode = canInsert ? "insert" : "center";
+        const buttons = document.querySelectorAll("." + SCRIPT_ID + "__junction-action");
+        for (const btn of buttons) {
+          btn.textContent = text;
+          btn.dataset.mode = mode;
+        }
       }
 
       function centerOnJunction(j) {
@@ -326,8 +473,60 @@
         try {
           sdk.Map.setMapCenter({ lonLat: { lon, lat } });
           sdk.Map.setZoomLevel({ zoomLevel: 17 });
+          setTimeout(updateActiveRowsByCenter, 0);
         } catch (e) {
           console.error(\`[\${SCRIPT_NAME}] setMapCenter failed\`, e);
+        }
+      }
+
+      function getMapCenterSafe() {
+        if (!sdk?.Map?.getMapCenter) return null;
+        try {
+          const res = sdk.Map.getMapCenter();
+          if (!res) return null;
+          if (res.lonLat && Number.isFinite(res.lonLat.lat) && Number.isFinite(res.lonLat.lon)) {
+            return res.lonLat;
+          }
+          if (Number.isFinite(res.lat) && Number.isFinite(res.lon)) {
+            return res;
+          }
+        } catch (_) {
+          return null;
+        }
+        return null;
+      }
+
+      const ACTIVE_RADIUS_M = 2500;
+      const LIST_RADIUS_M = 10000;
+      function distanceMeters(lat1, lon1, lat2, lon2) {
+        const r = 6371000;
+        const toRad = (d) => (d * Math.PI) / 180;
+        const dLat = toRad(lat2 - lat1);
+        const dLon = toRad(lon2 - lon1);
+        const a = Math.sin(dLat / 2) ** 2 +
+          Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+        return 2 * r * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      }
+
+      function updateActiveRowsByCenter() {
+        const center = getMapCenterSafe();
+        const rows = document.querySelectorAll("." + SCRIPT_ID + "__row[data-lat][data-lon]");
+        let bestRow = null;
+        let bestDist = Number.POSITIVE_INFINITY;
+        if (center) {
+          for (const row of rows) {
+            const lat = Number(row.dataset.lat);
+            const lon = Number(row.dataset.lon);
+            if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+            const d = distanceMeters(center.lat, center.lon, lat, lon);
+            if (d < bestDist) {
+              bestDist = d;
+              bestRow = row;
+            }
+          }
+        }
+        for (const row of rows) {
+          row.classList.toggle(SCRIPT_ID + "__row--active", Boolean(bestRow && bestRow === row && bestDist <= ACTIVE_RADIUS_M));
         }
       }
 
@@ -383,6 +582,10 @@
         for (const j of results) {
           const row = document.createElement("div");
           row.className = SCRIPT_ID + "__row";
+          const rowLat = Number(j.latitude);
+          const rowLon = Number(j.longitude);
+          row.dataset.lat = Number.isFinite(rowLat) ? String(rowLat) : "";
+          row.dataset.lon = Number.isFinite(rowLon) ? String(rowLon) : "";
 
           const left = document.createElement("div");
           left.className = SCRIPT_ID + "__left";
@@ -408,15 +611,26 @@
 
           const btn = document.createElement("button");
           btn.type = "button";
-          btn.className = "waze-btn waze-btn-blue waze-btn-smaller";
+          btn.className = "waze-btn waze-btn-blue waze-btn-smaller " + SCRIPT_ID + "__junction-action";
           btn.textContent = "Centruj";
-          btn.addEventListener("click", () => centerOnJunction(j));
+          btn.dataset.junctionName = String(j.name ?? "");
+          btn.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (btn.dataset.mode === "insert") {
+              insertJunctionName(j.name);
+              return;
+            }
+            centerOnJunction(j);
+          });
 
           right.appendChild(btn);
           row.appendChild(left);
           row.appendChild(right);
           listEl.appendChild(row);
         }
+        updateJunctionButtons();
+        updateActiveRowsByCenter();
       }
 
       function renderBorderResults(listEl, results, metaEl) {
@@ -484,13 +698,29 @@
         }
       }
 
+      const requestState = { junctions: null, borders: null };
+      const requestRetries = { junctions: 0, borders: 0 };
+      const REQUEST_RETRY_DELAY_MS = 1500;
+      const REQUEST_MAX_RETRIES = 1;
+      function ensureData(kind, fetchedEl, force = false) {
+        const hasData = kind === "borders" ? dataBorders.length > 0 : dataJunctions.length > 0;
+        if (!force && (hasData || requestState[kind])) return;
+        requestData(kind, fetchedEl, force);
+      }
       function requestData(kind, fetchedEl, force = false) {
+        const existing = requestState[kind];
+        if (existing && !force) return;
+        if (existing) {
+          window.removeEventListener("message", existing.onMsg);
+          clearTimeout(existing.timeout);
+          requestState[kind] = null;
+        }
+        if (force) requestRetries[kind] = 0;
         const requestId = String(Date.now()) + ":" + Math.random().toString(16).slice(2);
 
         const onMsg = (event) => {
           if (event.source !== window) return;
           const msg = event.data;
-          console.log("[" + SCRIPT_NAME + "] requestData: got message", msg && msg.type, { requestId, msgRequestId: msg && msg.requestId, ok: msg && msg.ok, kind });
           if (!msg || msg.source !== MSG_SOURCE) return;
           if (msg.type !== "DATA") return;
           if (msg.requestId !== requestId) return;
@@ -498,6 +728,7 @@
 
           window.removeEventListener("message", onMsg);
           clearTimeout(timeout);
+          requestState[kind] = null;
           console.log("[" + SCRIPT_NAME + "] requestData: matched DATA", { requestId, ok: msg.ok, kind });
 
           if (!msg.ok) {
@@ -506,15 +737,19 @@
             } else {
               dataJunctions = [];
             }
+            if (requestRetries[kind] < REQUEST_MAX_RETRIES) {
+              requestRetries[kind] += 1;
+              setTimeout(() => requestData(kind, fetchedEl, true), REQUEST_RETRY_DELAY_MS);
+            }
             return;
           }
 
           const fetchedAt = new Date(msg.fetchedAt || Date.now());
           if (fetchedEl) fetchedEl.textContent = "Ostatnie pobranie: " + fetchedAt.toLocaleString("pl-PL");
+          requestRetries[kind] = 0;
         };
 
         window.addEventListener("message", onMsg);
-        console.log("[" + SCRIPT_NAME + "] requestData: listener installed", { requestId, kind });
         const timeoutMs = 15000;
         const timeout = setTimeout(() => {
           console.warn("[" + SCRIPT_NAME + "] requestData: timeout waiting for DATA", { requestId, timeoutMs, kind });
@@ -524,8 +759,13 @@
             dataJunctions = [];
           }
           window.removeEventListener("message", onMsg);
+          requestState[kind] = null;
+          if (requestRetries[kind] < REQUEST_MAX_RETRIES) {
+            requestRetries[kind] += 1;
+            setTimeout(() => requestData(kind, fetchedEl, true), REQUEST_RETRY_DELAY_MS);
+          }
         }, timeoutMs);
-        console.log("[" + SCRIPT_NAME + "] requestData: postMessage REQUEST_DATA", { requestId, source: MSG_SOURCE, force, kind });
+        requestState[kind] = { requestId, onMsg, timeout };
         window.postMessage({ source: MSG_SOURCE, type: "REQUEST_DATA", requestId, force, kind }, "*");
       }
 
@@ -759,8 +999,12 @@
                   '<label>Nazwa przejścia' +
                   '<input class="form-control" type="text" id="__SID____borderName" placeholder="np. Jędrzychowice"></label>' +
                 '</div>' +
-                '<div class="__SID____field">' +
-                  '<button type="button" class="waze-btn waze-btn-blue" id="__SID____borderReload">Odśwież dane</button>' +
+                '<div class="__SID____field __SID____field--full __SID____field--actions">' +
+                  '<button type="button" class="waze-btn waze-btn-blue" id="__SID____borderReload">Odśwież dane</button><hr>' +
+                  '<label class="__SID____inline">' +
+                    '<input type="checkbox" id="__SID____borderClosed">' +
+                    'Tylko zamknięte' +
+                  '</label>' +
                 '</div>' +
               '</div>' +
               '<div class="__SID____bar">' +
@@ -796,6 +1040,7 @@
         const elBorderGeo = tabPane.querySelector("#" + SCRIPT_ID + "__borderGeo");
         const elBorderName = tabPane.querySelector("#" + SCRIPT_ID + "__borderName");
         const elBorderReload = tabPane.querySelector("#" + SCRIPT_ID + "__borderReload");
+        const elBorderClosed = tabPane.querySelector("#" + SCRIPT_ID + "__borderClosed");
         const elBorderFetched = tabPane.querySelector("#" + SCRIPT_ID + "__borderFetched");
         const elBorderMeta = tabPane.querySelector("#" + SCRIPT_ID + "__borderMeta");
         const elBorderList = tabPane.querySelector("#" + SCRIPT_ID + "__borderList");
@@ -818,10 +1063,10 @@
 
           if (kind === "borders") {
             if (!dataBorders || dataBorders.length === 0) {
-              requestData("borders", elBorderFetched, false);
+              ensureData("borders", elBorderFetched, false);
             }
           } else if (!dataJunctions || dataJunctions.length === 0) {
-            requestData("junctions", elFetched, false);
+            ensureData("junctions", elFetched, false);
           }
         };
 
@@ -833,10 +1078,10 @@
         tabLabel.addEventListener("click", () => {
           if (currentTab === "borders") {
             if (!dataBorders || dataBorders.length === 0) {
-              requestData("borders", elBorderFetched, false);
+              ensureData("borders", elBorderFetched, false);
             }
           } else if (!dataJunctions || dataJunctions.length === 0) {
-            requestData("junctions", elFetched, false);
+            ensureData("junctions", elFetched, false);
           }
         });
 
@@ -877,8 +1122,19 @@
           );
 
           if (!hasAnyFilter) {
-            elList.innerHTML = "";
-            elMeta.textContent = "Wybierz co najmniej jeden filtr, aby wyświetlić listę.";
+            const center = getMapCenterSafe();
+            if (!center) {
+              elList.innerHTML = "";
+              elMeta.textContent = "Brak centrum mapy. Przesuń mapę, aby wyświetlić węzły w promieniu 10 km.";
+              return;
+            }
+            const results = dataJunctions.filter((j) => {
+              const lat = Number(j.latitude);
+              const lon = Number(j.longitude);
+              if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
+              return distanceMeters(center.lat, center.lon, lat, lon) <= LIST_RADIUS_M;
+            });
+            renderResults(elList, results, elMeta, elSortKey.value, elSortDir.value);
             return;
           }
 
@@ -895,7 +1151,8 @@
           const hasAnyFilter = Boolean(
             (elBorderNeighbor.value && String(elBorderNeighbor.value).trim()) ||
             (elBorderGeo.value && String(elBorderGeo.value).trim()) ||
-            (elBorderName.value && String(elBorderName.value).trim())
+            (elBorderName.value && String(elBorderName.value).trim()) ||
+            elBorderClosed.checked
           );
 
           if (!hasAnyFilter) {
@@ -908,6 +1165,7 @@
             neighbor: elBorderNeighbor.value,
             geographical_border: elBorderGeo.value,
             name: elBorderName.value,
+            onlyClosed: elBorderClosed.checked,
           });
           renderBorderResults(elBorderList, results, elBorderMeta);
         };
@@ -934,7 +1192,15 @@
           }
           rerenderBordersDebounced();
         });
-        elBorderName.addEventListener("input", rerenderBordersDebounced);
+        elBorderName.addEventListener("input", () => {
+          if (String(elBorderName.value ?? "").trim() === "*") {
+            elBorderNeighbor.value = "";
+            elBorderGeo.value = "";
+            elBorderClosed.checked = false;
+          }
+          rerenderBordersDebounced();
+        });
+        elBorderClosed.addEventListener("change", rerenderBordersDebounced);
 
         elReload.addEventListener("click", () => {
           requestData("junctions", elFetched, true);
@@ -948,6 +1214,26 @@
           setTimeout(rerenderBorders, 0);
         });
 
+        if (sdk && sdk.Events && typeof sdk.Events.on === "function") {
+          const onSelectionChanged = () => {
+            console.log("[" + SCRIPT_NAME + "] wme-selection-changed");
+            updateJunctionButtons();
+          };
+          const onMapMoveEnd = () => {
+            updateActiveRowsByCenter();
+            if (currentTab === "junctions") {
+              rerenderJunctionsDebounced();
+            }
+          };
+          try {
+            sdk.Events.on({ eventName: "wme-selection-changed", eventHandler: onSelectionChanged });
+            sdk.Events.on({ eventName: "wme-map-move-end", eventHandler: onMapMoveEnd });
+            console.log("[" + SCRIPT_NAME + "] selection listener registered");
+          } catch (e) {
+            console.warn("[" + SCRIPT_NAME + "] selection listener error", e);
+          }
+        }
+
         elMeta.textContent = "Wybierz co najmniej jeden filtr, aby wyświetlić listę.";
 
         elBorderMeta.textContent = "Wybierz co najmniej jeden filtr, aby wyświetlić listę.";
@@ -957,6 +1243,10 @@
           if (event.source !== window) return;
           const msg = event.data;
           if (!msg || msg.source !== MSG_SOURCE) return;
+          if (msg.type === "DATA") {
+            const count = Array.isArray(msg.json && msg.json.response) ? msg.json.response.length : null;
+            console.log("[" + SCRIPT_NAME + "] DATA message", { ok: msg.ok, kind: msg.kind, count });
+          }
           if (msg.type !== "DATA" || !msg.ok) return;
 
           const arr = Array.isArray(msg.json && msg.json.response) ? msg.json.response : [];
@@ -1008,7 +1298,7 @@
           rerenderJunctions();
         });
 
-        setActiveTab("junctions", { fetch: false });
+        setActiveTab("junctions");
       }
 
       // ---------------------------
