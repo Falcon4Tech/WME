@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name                                     WME Node Finder
-// @version                                       2602.12
+// @version                                       2602.15
 // @tag                                            WME
 // @description       [Only for Poland] Tab in Scripts with a search engine for GDDKiA road nodes and border crossings.
 // @description:pl    Zakładka w Scripts (WME SDK) z wyszukiwarką węzłów drogowych GDDKiA i przejść granicznych.
@@ -18,10 +18,23 @@
 // @run-at            document-idle
 // ==/UserScript==
 
-/* global unsafeWindow */
+/** @typedef {import("../types").WmeSDK} WmeSDK */
+/** @typedef {import("../types").Venue} Venue */
+/** @typedef {import("../types").SelectionWithLocalizedTypeName} SelectionWithLocalizedTypeName */
+/** @typedef {import("../types").LonLat} LonLat */
+/** @typedef {{ ts: number, json: any }} CachePayload */
+/** @typedef {"junctions" | "borders"} DataKind */
+/** @typedef {{ value: string, label: string }} SelectOption */
+/** @typedef {{ label: string, options: SelectOption[] }} SelectOptionGroup */
+/** @typedef {{ road?: string, branch?: string, name?: string, number?: string | number | null }} JunctionFilters */
+/** @typedef {{ neighbor?: string, geographical_border?: string, name?: string, onlyClosed?: boolean }} BorderFilters */
+/** @typedef {{ id: string | number | null, branch: string, name: string, road_number: string, mileage: number | string | null, number: number | string | null, latitude: number | string | null, longitude: number | string | null }} JunctionItem */
+/** @typedef {{ id: string | number | null, geographical_border: string, neighbor: string, type_of_traffic: string, name_border_crossing: string, road_number: string, latitude: number | string | null, longitude: number | string | null, limitations: string, border_kind: string, other: string }} BorderItem */
 
 /**
  * CHANGELOG:
+ *    2602.15 - Poprawka wstawiania nazwy węzła z numerem do venue
+ *    2602.14 - Dodanie typów JSDoc dla uniknięcia błędów i lepszej czytelności kodu
  *    2602.12 - Refaktor kodu pod pełne wsparcie WME SDK
  *    2602.6  - Po zaznaczeniu węzła na mpapie, przycisk zmienia się na "↪︎" do wstawiania nazwy węzła
  *    2602.5  - Przy braku wybranych filtrów, wyświetlane są węzły w promieniu 25 km, węzeł w centrum mapy jest podświetlany na liście
@@ -61,6 +74,10 @@
     if (DEBUG) console.log(`[${SCRIPT_NAME}]`, ...args);
   };
 
+  /**
+   * @param {string} key
+   * @returns {CachePayload | null}
+   */
   function loadCache(key) {
     try {
       const raw = localStorage.getItem(key);
@@ -75,6 +92,11 @@
     }
   }
 
+  /**
+   * @param {string} key
+   * @param {any} json
+   * @returns {CachePayload | null}
+   */
   function saveCache(key, json) {
     try {
       const payload = { ts: Date.now(), json };
@@ -85,6 +107,10 @@
     }
   }
 
+  /**
+   * @param {string} url
+   * @returns {Promise<any>}
+   */
   function gmFetchJson(url) {
     return new Promise((resolve, reject) => {
       log("gmFetchJson: start", url);
@@ -124,6 +150,13 @@
     });
   }
 
+  /**
+   * @param {number} lat1
+   * @param {number} lon1
+   * @param {number} lat2
+   * @param {number} lon2
+   * @returns {number}
+   */
   function distanceMeters(lat1, lon1, lat2, lon2) {
     const r = 6371000;
     const toRad = (d) => (d * Math.PI) / 180;
@@ -134,11 +167,12 @@
     return 2 * r * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   }
 
+  /** @type {WmeSDK | null} */
   let sdk = null;
+  /** @type {JunctionItem[]} */
   let dataJunctions = [];
+  /** @type {BorderItem[]} */
   let dataBorders = [];
-  let venueGetter = null;
-  let selectionGetterLogged = false;
 
   const esc = (s) => String(s ?? "")
     .replaceAll("&", "&amp;")
@@ -153,12 +187,21 @@
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "");
 
+  /**
+   * @param {number | string | null | undefined} mileage
+   * @returns {string}
+   */
   const formatKm = (mileage) => {
     const n = Number(mileage);
     if (!Number.isFinite(n)) return "—";
     return n.toFixed(3) + " km";
   };
 
+  /**
+   * @param {(...args: any[]) => void} fn
+   * @param {number} [ms=200]
+   * @returns {(...args: any[]) => void}
+   */
   const debounce = (fn, ms = 200) => {
     let t = null;
     return (...args) => {
@@ -207,6 +250,10 @@
     document.head.appendChild(style);
   }
 
+  /**
+   * @param {JunctionFilters} filters
+   * @returns {JunctionItem[]}
+   */
   function applyJunctionFilters(filters) {
     const fRoadRaw = String(filters.road ?? "").trim();
     const fRoadBase = fRoadRaw ? roadBase(fRoadRaw) : "";
@@ -227,6 +274,10 @@
     });
   }
 
+  /**
+   * @param {BorderFilters} filters
+   * @returns {BorderItem[]}
+   */
   function applyBorderFilters(filters) {
     const fNeighbor = norm(filters.neighbor);
     const fGeo = norm(filters.geographical_border);
@@ -247,78 +298,70 @@
     });
   }
 
+  /**
+   * @param {string} venueId
+   * @returns {Venue | null}
+   */
   function getVenueById(venueId) {
-    if (!venueGetter) {
-      if (sdk?.DataModel?.Venues?.getById) {
-        venueGetter = (id) => sdk.DataModel.Venues.getById({ venueId: id });
-      } else if (sdk?.Venues?.getById) {
-        venueGetter = (id) => sdk.Venues.getById({ venueId: id });
-      } else if (sdk?.venues?.getById) {
-        venueGetter = (id) => sdk.venues.getById({ venueId: id });
-      } else {
-        return null;
-      }
-    }
-    return venueGetter(venueId);
+    return sdk.DataModel.Venues.getById({ venueId });
   }
 
+  /**
+   * @returns {SelectionWithLocalizedTypeName | null}
+   */
   function getSelectionSafe() {
-    if (!sdk?.Editing?.getSelection) {
-      if (!selectionGetterLogged) {
-        console.warn("[" + SCRIPT_NAME + "] getSelection not available on SDK");
-        selectionGetterLogged = true;
-      }
-      return null;
-    }
-    if (!selectionGetterLogged) selectionGetterLogged = true;
     return sdk.Editing.getSelection();
   }
 
+  /**
+   * @returns {string | null}
+   */
   function getSelectedVenueId() {
     const sel = getSelectionSafe();
     if (!sel || !sel.ids || sel.ids.length === 0) return null;
-    const type = sel.objectType;
-    const typeStr = typeof type === "string" ? type.toUpperCase() : "";
-    const isVenue = typeStr === "VENUE" ||
-      type === sdk?.DataModel?.VENUE ||
-      type === sdk?.Objects?.VENUE ||
-      type === sdk?.Selection?.VENUE ||
-      type === sdk?.VENUE;
-    if (!isVenue) return null;
-    return String(sel.ids[0]);
+    if (sel.objectType !== "venue") return null;
+    return sel.ids[0];
   }
 
+  /**
+   * @returns {{ venueId: string, venue: Venue | null, categories: Venue["categories"] | null, isJunction: boolean } | null}
+   */
   function getSelectedVenueInfo() {
     const venueId = getSelectedVenueId();
     if (!venueId) return null;
     const venue = getVenueById(venueId);
     if (!venue) return { venueId, venue: null, categories: null, isJunction: false };
-    const categories = Array.isArray(venue.categories) ? venue.categories : [];
+    const categories = venue.categories;
     const isJunction = categories.some((c) => String(c).toUpperCase() === "JUNCTION_INTERCHANGE");
     return { venueId, venue, categories, isJunction };
   }
 
+  /**
+   * @returns {{ venueId: string, venue: Venue | null, categories: Venue["categories"] | null, isJunction: boolean } | null}
+   */
   function canInsertIntoSelectedVenue() {
     const info = getSelectedVenueInfo();
     if (!info || !info.isJunction) return null;
-    if (sdk?.Editing?.isEditingAllowed && !sdk.Editing.isEditingAllowed()) return null;
+    if (!sdk.Editing.isEditingAllowed()) return null;
     return info;
   }
 
-  function insertJunctionName(name) {
+  /**
+   * @param {string} name
+   * @param {string | number | null | undefined} number
+   * @returns {boolean}
+   */
+  function insertJunctionName(name, number) {
     const info = canInsertIntoSelectedVenue();
     if (!info) {
       log("insertJunctionName: no venue or not allowed");
       return false;
     }
     const cleanName = String(name ?? "").trim();
-    const label = "↗ " + cleanName;
-    const venuesModel = sdk?.DataModel?.Venues;
-    const update = venuesModel?.updateVenue;
-    if (typeof update !== "function") {
-      log("insertJunctionName: sdk.DataModel.Venues.updateVenue not available");
-      return false;
-    }
+    const num = number === null || number === undefined ? "" : String(number).trim();
+    const label = num ? `↗${num} ${cleanName}` : `↗ ${cleanName}`;
+    const venuesModel = sdk.DataModel.Venues;
+    const update = venuesModel.updateVenue;
     if (!info.venue) {
       log("insertJunctionName: venue missing");
       return false;
@@ -340,9 +383,12 @@
   let delayedVenueCheckTimer = null;
   let delayedVenueCheckId = "";
   const DELAYED_VENUE_CHECK_MS = 200;
+  /**
+   * @returns {void}
+   */
   function updateJunctionButtons() {
     const info = getSelectedVenueInfo();
-    const editingAllowed = !(sdk?.Editing?.isEditingAllowed) || sdk.Editing.isEditingAllowed();
+    const editingAllowed = sdk.Editing.isEditingAllowed();
     const canInsert = Boolean(info && info.isJunction && editingAllowed);
     const stateKey = JSON.stringify({
       canInsert,
@@ -379,6 +425,9 @@
     }
   }
 
+  /**
+   * @param {{ latitude: number, longitude: number }} j
+   */
   function centerOnJunction(j) {
     const lat = Number(j.latitude);
     const lon = Number(j.longitude);
@@ -392,23 +441,18 @@
     }
   }
 
+  /**
+   * @returns {LonLat | null}
+   */
   function getMapCenterSafe() {
-    if (!sdk?.Map?.getMapCenter) return null;
-    try {
-      const res = sdk.Map.getMapCenter();
-      if (!res) return null;
-      if (res.lonLat && Number.isFinite(res.lonLat.lat) && Number.isFinite(res.lonLat.lon)) {
-        return res.lonLat;
-      }
-      if (Number.isFinite(res.lat) && Number.isFinite(res.lon)) {
-        return res;
-      }
-    } catch (_) {
-      return null;
-    }
+    const res = sdk.Map.getMapCenter();
+    if (Number.isFinite(res.lat) && Number.isFinite(res.lon)) return res;
     return null;
   }
 
+  /**
+   * @returns {void}
+   */
   function updateActiveRowsByCenter() {
     const center = getMapCenterSafe();
     const rows = document.querySelectorAll("." + SCRIPT_ID + "__row[data-lat][data-lon]");
@@ -431,6 +475,14 @@
     }
   }
 
+  /**
+   * @param {HTMLElement} listEl
+   * @param {JunctionItem[]} results
+   * @param {HTMLElement} metaEl
+   * @param {"name" | "mileage" | string} sortKey
+   * @param {"asc" | "desc" | string} sortDir
+   * @returns {void}
+   */
   function renderResults(listEl, results, metaEl, sortKey, sortDir) {
     listEl.innerHTML = "";
     metaEl.textContent = results.length === 0 ? "Brak wyników." : `Wyniki: ${results.length}`;
@@ -518,7 +570,7 @@
         event.preventDefault();
         event.stopPropagation();
         if (btn.dataset.mode === "insert") {
-          insertJunctionName(j.name);
+          insertJunctionName(j.name, j.number);
           return;
         }
         centerOnJunction(j);
@@ -533,6 +585,12 @@
     updateActiveRowsByCenter();
   }
 
+  /**
+   * @param {HTMLElement} listEl
+   * @param {BorderItem[]} results
+   * @param {HTMLElement} metaEl
+   * @returns {void}
+   */
   function renderBorderResults(listEl, results, metaEl) {
     listEl.innerHTML = "";
     metaEl.textContent = results.length === 0 ? "Brak wyników." : ("Wyniki: " + results.length);
@@ -598,6 +656,11 @@
     }
   }
 
+  /**
+   * @param {HTMLSelectElement} selectEl
+   * @param {SelectOption[]} options
+   * @param {boolean} [keepValue=true]
+   */
   function setSelectOptions(selectEl, options, keepValue = true) {
     const prev = keepValue ? String(selectEl.value ?? "") : "";
     selectEl.innerHTML = "";
@@ -613,6 +676,10 @@
     }
   }
 
+  /**
+   * @param {string} v
+   * @returns {{ raw: string, prefix: string, num: number, suffix: string }}
+   */
   function parseRoadId(v) {
     const s = String(v ?? "")
       .trim()
@@ -630,6 +697,10 @@
     };
   }
 
+  /**
+   * @param {string} v
+   * @returns {string}
+   */
   function roadBase(v) {
     const s = String(v ?? "").toUpperCase();
     let m = s.match(/([AS])\s*0*([0-9]{1,2})(?![0-9])/);
@@ -639,6 +710,11 @@
     return "";
   }
 
+  /**
+   * @param {string} a
+   * @param {string} b
+   * @returns {number}
+   */
   function cmpRoad(a, b) {
     const pa = parseRoadId(a);
     const pb = parseRoadId(b);
@@ -649,6 +725,10 @@
     return pa.suffix.localeCompare(pb.suffix, "pl");
   }
 
+  /**
+   * @param {JunctionItem[]} items
+   * @returns {SelectOptionGroup[]}
+   */
   function buildRoadBaseGroupedOptions(items) {
     const groups = {
       DK: [],
@@ -689,6 +769,12 @@
     ].filter(Boolean);
   }
 
+  /**
+   * @param {HTMLSelectElement} selectEl
+   * @param {SelectOptionGroup[]} groups
+   * @param {boolean} [keepValue=true]
+   * @param {string} [emptyLabel="—"]
+   */
   function setSelectOptionsGrouped(selectEl, groups, keepValue = true, emptyLabel = "—") {
     const prev = keepValue ? String(selectEl.value ?? "") : "";
     selectEl.innerHTML = "";
@@ -716,6 +802,14 @@
     }
   }
 
+  /**
+   * @template T
+   * @param {T[]} items
+   * @param {(item: T) => unknown} getValue
+   * @param {string} [emptyLabel="—"]
+   * @param {((a: string, b: string) => number) | null} [comparator=null]
+   * @returns {SelectOption[]}
+   */
   function buildUniqueOptions(items, getValue, emptyLabel = "—", comparator = null) {
     const set = new Set();
     for (const it of items) {
@@ -734,6 +828,10 @@
     return [{ value: "", label: emptyLabel }, ...arr.map((x) => ({ value: x, label: x }))];
   }
 
+  /**
+   * @param {JunctionItem[]} items
+   * @returns {SelectOption[]}
+   */
   function buildNumberOptions(items) {
     const set = new Set();
     for (const it of items) {
@@ -748,6 +846,10 @@
     return [{ value: "", label: "—" }, ...arr.map((x) => ({ value: String(x), label: String(x) }))];
   }
 
+  /**
+   * @param {any[]} arr
+   * @returns {JunctionItem[]}
+   */
   function mapJunctions(arr) {
     return arr
       .filter((x) => x && typeof x === "object")
@@ -763,6 +865,10 @@
       }));
   }
 
+  /**
+   * @param {any[]} arr
+   * @returns {BorderItem[]}
+   */
   function mapBorders(arr) {
     return arr
       .filter((x) => x && typeof x === "object")
@@ -781,6 +887,9 @@
       }));
   }
 
+  /**
+   * @returns {Promise<void>}
+   */
   async function buildTab() {
     injectStyles();
 
@@ -891,17 +1000,30 @@
     const elBorderMeta = tabPane.querySelector("#" + SCRIPT_ID + "__borderMeta");
     const elBorderList = tabPane.querySelector("#" + SCRIPT_ID + "__borderList");
 
+    /** @type {DataKind} */
     let currentTab = "junctions";
 
+    /** @type {Record<DataKind, string | null>} */
     const requestState = { junctions: null, borders: null };
+    /** @type {Record<DataKind, number>} */
     const requestRetries = { junctions: 0, borders: 0 };
 
+    /**
+     * @param {DataKind} kind
+     * @returns {CachePayload | null}
+     */
     const getCached = (kind) => {
       const cached = loadCache(CACHE_KEYS[kind]);
       if (cached && Date.now() - cached.ts <= CACHE_TTL_MS) return cached;
       return null;
     };
 
+    /**
+     * @param {DataKind} kind
+     * @param {any} json
+     * @param {number} fetchedAt
+     * @param {HTMLElement | null} fetchedEl
+     */
     const handleData = (kind, json, fetchedAt, fetchedEl) => {
       const arr = Array.isArray(json && json.response) ? json.response : [];
       if (kind === "borders") {
@@ -920,12 +1042,23 @@
       if (fetchedEl) fetchedEl.textContent = "Ostatnie pobranie: " + fetchedAtDate.toLocaleString("pl-PL");
     };
 
+    /**
+     * @param {DataKind} kind
+     * @param {HTMLElement | null} fetchedEl
+     * @param {boolean} [force=false]
+     */
     const ensureData = (kind, fetchedEl, force = false) => {
       const hasData = kind === "borders" ? dataBorders.length > 0 : dataJunctions.length > 0;
       if (!force && (hasData || requestState[kind])) return;
       requestData(kind, fetchedEl, force);
     };
 
+    /**
+     * @param {DataKind} kind
+     * @param {HTMLElement | null} fetchedEl
+     * @param {boolean} [force=false]
+     * @returns {Promise<void>}
+     */
     const requestData = async (kind, fetchedEl, force = false) => {
       const existing = requestState[kind];
       if (existing && !force) return;
@@ -965,6 +1098,10 @@
       }
     };
 
+    /**
+     * @param {DataKind} kind
+     * @param {{ fetch?: boolean }} [opts]
+     */
     const setActiveTab = (kind, opts = {}) => {
       const shouldFetch = opts.fetch !== false;
 
@@ -1148,6 +1285,7 @@
   }
 
   function initSdk() {
+    /** @type {Window & { SDK_INITIALIZED?: Promise<void>, getWmeSdk?: (args: { scriptId: string, scriptName: string }) => WmeSDK }} */
     const UW = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
     let started = false;
 
