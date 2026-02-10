@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name                                     WME Node Finder
-// @version                                       2602.15
+// @version                                       2602.17
 // @tag                                            WME
 // @description       [Only for Poland] Tab in Scripts with a search engine for GDDKiA road nodes and border crossings.
 // @description:pl    Zakładka w Scripts (WME SDK) z wyszukiwarką węzłów drogowych GDDKiA i przejść granicznych.
@@ -368,7 +368,7 @@
     }
     const payload = { venueId: info.venueId, name: label, aliases: ["węzeł " + cleanName] };
     const v = info.venue;
-    if (v && v.lockRank !== 2) payload.lockRank = 2;
+    if (v && v.lockRank !== 3) payload.lockRank = 3;
     try {
       const res = update.call(venuesModel, payload);
       log("insertJunctionName: updated", { venueId: info.venueId, name: label, res, updateName: "sdk.DataModel.Venues.updateVenue" });
