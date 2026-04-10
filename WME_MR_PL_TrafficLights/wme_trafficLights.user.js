@@ -224,8 +224,7 @@
   function zoomFade(zoom) {
     if (zoom <= 15) return 1;
     if (zoom >= 21) return 0;
-    if (zoom <= 20) return 1 - ((zoom - 15) / 5) * 0.95; // 1 → 0.05
-    return 0.05 * (21 - zoom); // 0.05 → 0 between z20 and z21
+    return 1 - ((zoom - 15) / 5) * 0.95; // 16–20: linear 1.0 → 0.05
   }
 
   // ── Layer init & rendering ─────────────────────────────────────────────
@@ -252,15 +251,15 @@
           style: { fillOpacity: '${getFillOpacity}', strokeColor: '#ff0000', strokeWidth: 1, strokeOpacity: '${getStrokeOpacity}' },
         },
         {
-          predicate: (p) => p.status === 1,
+          predicate: (p) => p.status === STATUS.EMPTY,
           style: { fillColor: '#ff3939', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
         },
         {
-          predicate: (p) => p.status === 2,
+          predicate: (p) => p.status === STATUS.IN_PROGRESS,
           style: { fillColor: '#f5c400', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
         },
         {
-          predicate: (p) => p.status === 3,
+          predicate: (p) => p.status === STATUS.DONE,
           style: { fillColor: '#00a650', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
         },
       ],
@@ -325,13 +324,15 @@
   }
 
   // ── Status update with API + rollback ─────────────────────────────────
+  // updatedBy: string → set, null → delete, undefined → leave unchanged
   function applyTileStatus(tileId, status, updatedBy = undefined) {
     if (status === null) {
       tileStatuses.delete(tileId);
       tileUpdatedBy.delete(tileId);
     } else {
       tileStatuses.set(tileId, status);
-      if (updatedBy !== undefined) tileUpdatedBy.set(tileId, updatedBy);
+      if (updatedBy === null)          tileUpdatedBy.delete(tileId);
+      else if (updatedBy !== undefined) tileUpdatedBy.set(tileId, updatedBy);
     }
     try { sdk.Map.removeFeatureFromLayer({ layerName: LAYER_NAME, featureId: tileId }); } catch (_) {}
     try {
@@ -378,7 +379,7 @@
       }
     } catch (e) {
       log('Status update failed, rolling back:', e);
-      applyTileStatus(tileId, prevStatus, prevUpdatedBy ?? undefined); // rollback
+      applyTileStatus(tileId, prevStatus, prevUpdatedBy); // rollback; null → delete author
     }
   }
 
