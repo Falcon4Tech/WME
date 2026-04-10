@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                WME MapRaid PL Traffic Lights
 // @name:pl             WME MapRaid PL Sygnalizacja
-// @version             0.2.7
+// @version             0.3.0
 // @tag                 WME
 // @description         MapRaid coordination grid – mark traffic-light work tiles on the map.
 // @description:pl      Siatka koordynacyjna MapRaid – oznaczanie kafelków sygnalizacji świetlnej.
@@ -22,7 +22,8 @@
 
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
-  const SCRIPT_ID   = 'WME_MR_PL_TrafficLights';
+  const SCRIPT_ID      = 'WME_MR_PL_TrafficLights';
+  const SCRIPT_VERSION = '0.3.0';
   const SCRIPT_NAME = 'MapRaid TL';
   const START_GUARD = '__WME_MAPRAID_TL_BOOTSTRAPPED__';
   const LAYER_NAME  = 'tl.grid';
@@ -34,7 +35,8 @@
 
   // ── UI config (not fetched from API) ──────────────────────────────────
   const UI_CONFIG = {
-    renderZoomMin:  11,    // don't render grid at zoom 10 and below
+    colorsZoomMin:  7,     // zoom 7-10: only tiles without grid lines
+    renderZoomMin:  11,    // zoom 11+: full grid including null tiles (red border)
     uiZoomMin:      13,    // status buttons visible from this zoom
     uiZoomMax:      14,    // status buttons visible up to this zoom
     maxRenderTiles: 5000,  // hard cap on features added in one pass
@@ -54,16 +56,18 @@
   // 3    = done        – fully mapped
   const STATUS = Object.freeze({ EMPTY: 1, IN_PROGRESS: 2, DONE: 3 });
 
-  let CONFIG         = null; // set after fetchConfig()
-  const tileStatuses = new Map(); // tileId → 1 | 2 | 3
-  let tilesEtag      = null;
-  let configEtag     = null;
+  let CONFIG          = null; // set after fetchConfig()
+  const tileStatuses  = new Map(); // tileId → 1 | 2 | 3
+  const tileUpdatedBy = new Map(); // tileId → string | null
+  let tilesEtag       = null;
+  let configEtag      = null;
 
   let sdk            = null;
   let layerVisible   = true;
   let selectedTileId = null;
   let panel          = null;
   let renderTimer    = null;
+  let altPressed     = false;
 
   // ── Grid config builder ────────────────────────────────────────────────
   function buildConfig(apiData) {
@@ -101,50 +105,55 @@
   }
 
   function extractEtag(responseHeaders) {
-    // Matches both strong ("abc") and weak (W/"abc") ETags, preserving quotes.
     const match = responseHeaders?.match(/etag:\s*(W\/"[^"]*"|"[^"]*")/i)?.[1] ?? null;
     dbg('extractEtag raw headers:', responseHeaders);
     dbg('extractEtag result:', match);
     return match;
   }
 
-  async function fetchConfig() {
+  // Shared GET with ETag support. Returns { status, data, etag } or throws.
+  async function fetchWithEtag(label, url, currentEtag) {
     const headers = { Accept: 'application/json' };
-    if (configEtag) headers['If-None-Match'] = configEtag;
-    dbg('fetchConfig → sending headers:', headers);
+    if (currentEtag) headers['If-None-Match'] = currentEtag;
+    dbg(`${label} → GET ${url}`, headers);
 
-    const res = await apiFetch(`${API_BASE}/config/${API_CONFIG_ID}`, { headers });
-    dbg('fetchConfig ← status:', res.status, '| response ETag:', extractEtag(res.responseHeaders));
+    const res = await apiFetch(url, { headers });
+    const etag = extractEtag(res.responseHeaders);
+    dbg(`${label} ← status:`, res.status, '| ETag:', etag);
 
-    if (res.status === 304) { dbg('fetchConfig: 304 – config unchanged'); return; }
-    if (res.status !== 200) throw new Error(`Config fetch failed: HTTP ${res.status}`);
+    return { status: res.status, data: res.response, etag };
+  }
 
-    configEtag = extractEtag(res.responseHeaders) ?? configEtag;
+  async function fetchConfig() {
+    const { status, data, etag } = await fetchWithEtag('fetchConfig', `${API_BASE}/config/${API_CONFIG_ID}`, configEtag);
+    if (status === 304) { dbg('fetchConfig: 304 – unchanged'); return; }
+    if (status !== 200) throw new Error(`Config fetch failed: HTTP ${status}`);
+
+    configEtag = etag ?? configEtag;
     dbg('fetchConfig: stored configEtag:', configEtag);
-    CONFIG = buildConfig(res.response);
+    if (data.version && data.version !== SCRIPT_VERSION) {
+      log(`⚠ Version mismatch: script=${SCRIPT_VERSION}, API=${data.version}. Consider updating.`);
+    }
+    CONFIG = buildConfig(data);
     log(`Config loaded: ${CONFIG.gridRows}×${CONFIG.gridCols} tiles, ${CONFIG.tileSizeKm} km each.`);
   }
 
   async function fetchTiles() {
-    const headers = { Accept: 'application/json' };
-    if (tilesEtag) headers['If-None-Match'] = tilesEtag;
-    dbg('fetchTiles → sending headers:', headers);
+    const { status, data, etag } = await fetchWithEtag('fetchTiles', `${API_BASE}/config/${API_CONFIG_ID}/tiles`, tilesEtag);
+    if (status === 304) { dbg('fetchTiles: 304 – unchanged'); return false; }
+    if (status !== 200) throw new Error(`Tiles fetch failed: HTTP ${status}`);
 
-    const res = await apiFetch(`${API_BASE}/config/${API_CONFIG_ID}/tiles`, { headers });
-    dbg('fetchTiles ← status:', res.status, '| response ETag:', extractEtag(res.responseHeaders));
-
-    if (res.status === 304) { dbg('fetchTiles: 304 – tiles unchanged'); return false; }
-    if (res.status !== 200) throw new Error(`Tiles fetch failed: HTTP ${res.status}`);
-
-    tilesEtag = extractEtag(res.responseHeaders) ?? tilesEtag;
+    tilesEtag = etag ?? tilesEtag;
     dbg('fetchTiles: stored tilesEtag:', tilesEtag);
 
     tileStatuses.clear();
-    for (const tile of res.response.tiles) {
-      tileStatuses.set(tile.id, tile.status);
+    tileUpdatedBy.clear();
+    for (const tile of data.tiles) {
+      tileStatuses.set(tile.i, tile.s);
+      if (tile.u) tileUpdatedBy.set(tile.i, tile.u);
     }
     dbg('fetchTiles: loaded', tileStatuses.size, 'tiles');
-    return true; // data changed
+    return true;
   }
 
   // ── Grid math ──────────────────────────────────────────────────────────
@@ -268,26 +277,41 @@
     if (!layerVisible) return;
 
     const zoom = sdk.Map.getZoomLevel();
-    if (zoom < CONFIG.renderZoomMin) {
+    if (zoom < CONFIG.colorsZoomMin) {
       try { sdk.Map.removeAllFeaturesFromLayer({ layerName: LAYER_NAME }); } catch (_) {}
       return;
     }
 
+    const colorsOnly = zoom < CONFIG.renderZoomMin;
+
     const bounds = getViewportBounds();
     if (!bounds) return;
 
-    const ids = getVisibleTileIds(bounds.south, bounds.west, bounds.north, bounds.east);
+    let features;
+    if (colorsOnly) {
+      // At low zoom iterate only over the small set of colored tiles – avoids
+      // the centering cap that would cut off tiles outside a central sub-rectangle.
+      features = [];
+      for (const [id, status] of tileStatuses) {
+        const [row, col] = id.split('_').map(Number);
+        const tileSouth = CONFIG.gridOriginLat + row * CONFIG.latStep;
+        const tileWest  = CONFIG.gridOriginLon + col * CONFIG.lonStep;
+        if (tileSouth + CONFIG.latStep < bounds.south || tileSouth > bounds.north) continue;
+        if (tileWest  + CONFIG.lonStep < bounds.west  || tileWest  > bounds.east)  continue;
+        features.push({ type: 'Feature', id, geometry: tileIdToGeometry(id), properties: { status } });
+      }
+    } else {
+      const ids = getVisibleTileIds(bounds.south, bounds.west, bounds.north, bounds.east);
+      features = ids.map((id) => ({
+        type: 'Feature', id,
+        geometry: tileIdToGeometry(id),
+        properties: { status: tileStatuses.get(id) ?? null },
+      }));
+    }
 
     try { sdk.Map.removeAllFeaturesFromLayer({ layerName: LAYER_NAME }); } catch (_) {}
-    if (ids.length === 0) return;
 
-    const features = ids.map((id) => ({
-      type: 'Feature',
-      id,
-      geometry: tileIdToGeometry(id),
-      properties: { status: tileStatuses.get(id) ?? null },
-    }));
-
+    if (features.length === 0) return;
     try {
       sdk.Map.addFeaturesToLayer({ layerName: LAYER_NAME, features });
     } catch (e) {
@@ -301,11 +325,13 @@
   }
 
   // ── Status update with API + rollback ─────────────────────────────────
-  function applyTileStatus(tileId, status) {
+  function applyTileStatus(tileId, status, updatedBy = undefined) {
     if (status === null) {
       tileStatuses.delete(tileId);
+      tileUpdatedBy.delete(tileId);
     } else {
       tileStatuses.set(tileId, status);
+      if (updatedBy !== undefined) tileUpdatedBy.set(tileId, updatedBy);
     }
     try { sdk.Map.removeFeatureFromLayer({ layerName: LAYER_NAME, featureId: tileId }); } catch (_) {}
     try {
@@ -324,8 +350,11 @@
   }
 
   async function updateTileStatus(tileId, newStatus) {
-    const prevStatus = tileStatuses.get(tileId) ?? null;
-    applyTileStatus(tileId, newStatus); // optimistic
+    const prevStatus    = tileStatuses.get(tileId) ?? null;
+    const prevUpdatedBy = tileUpdatedBy.get(tileId) ?? null;
+    const user          = sdk.State.getUserInfo()?.userName ?? '';
+
+    applyTileStatus(tileId, newStatus, newStatus === null ? undefined : user); // optimistic
 
     try {
       if (newStatus === null) {
@@ -335,7 +364,6 @@
         );
         if (res.status !== 204) throw new Error(`DELETE failed: HTTP ${res.status}`);
       } else {
-        const user = sdk.State.getUserInfo()?.userName ?? '';
         const res = await apiFetch(
           `${API_BASE}/config/${API_CONFIG_ID}/tiles/${tileId}`,
           {
@@ -345,10 +373,12 @@
           },
         );
         if (res.status !== 200) throw new Error(`PATCH failed: HTTP ${res.status}`);
+        // Confirm server-side updatedBy (should match, but trust the response)
+        if (res.response?.u) tileUpdatedBy.set(tileId, res.response.u);
       }
     } catch (e) {
       log('Status update failed, rolling back:', e);
-      applyTileStatus(tileId, prevStatus); // rollback
+      applyTileStatus(tileId, prevStatus, prevUpdatedBy ?? undefined); // rollback
     }
   }
 
@@ -419,11 +449,13 @@
 
   // ── Status panel ───────────────────────────────────────────────────────
   const STATUS_BUTTONS = [
-    { label: 'Brak dróg', status: STATUS.EMPTY,       bg: '#888888', fg: '#ffffff' },
+    { label: 'Brak 🚦', status: STATUS.EMPTY,       bg: '#888888', fg: '#ffffff' },
     { label: 'W trakcie', status: STATUS.IN_PROGRESS, bg: '#f5c400', fg: '#333333' },
     { label: 'Gotowe',    status: STATUS.DONE,        bg: '#00a650', fg: '#ffffff' },
-    { label: '✕ Resetuj', status: null,               bg: '#dddddd', fg: '#333333' },
+    { label: '✕ Wyczyść', status: null,               bg: '#dddddd', fg: '#333333' },
   ];
+
+  let panelUserLabel = null; // <span> showing updatedBy
 
   function createStatusPanel() {
     panel = document.createElement('div');
@@ -442,6 +474,7 @@
       'pointer-events:auto',
     ].join(';');
 
+    const btnRow = document.createElement('div');
     STATUS_BUTTONS.forEach(({ label, status, bg, fg }) => {
       const btn = document.createElement('button');
       btn.textContent = label;
@@ -460,8 +493,13 @@
         if (selectedTileId) updateTileStatus(selectedTileId, status);
         hideStatusPanel();
       });
-      panel.appendChild(btn);
+      btnRow.appendChild(btn);
     });
+    panel.appendChild(btnRow);
+
+    panelUserLabel = document.createElement('div');
+    panelUserLabel.style.cssText = 'margin-top:5px;font-size:11px;color:#666;text-align:center';
+    panel.appendChild(panelUserLabel);
 
     try {
       const viewport = sdk.Map.getMapViewportElement();
@@ -474,6 +512,11 @@
   function showStatusPanel(tileId, px, py) {
     if (!panel) return;
     selectedTileId = tileId;
+
+    const user = tileUpdatedBy.get(tileId);
+    panelUserLabel.textContent = user ? `✎ ${user}` : '';
+    panelUserLabel.style.display = user ? 'block' : 'none';
+
     panel.style.display = 'block';
     const h = panel.offsetHeight || 40;
     panel.style.left = `${px}px`;
@@ -486,15 +529,38 @@
   }
 
   // ── Click detection ────────────────────────────────────────────────────
+  // ── Neighbor status (alt+click) ────────────────────────────────────────
+  function getNeighborStatus(tileId) {
+    const [row, col] = tileId.split('_').map(Number);
+    const neighbors = [
+      `${row - 1}_${col - 1}`, `${row - 1}_${col}`, `${row - 1}_${col + 1}`,
+      `${row}_${col - 1}`,                           `${row}_${col + 1}`,
+      `${row + 1}_${col - 1}`, `${row + 1}_${col}`, `${row + 1}_${col + 1}`,
+    ];
+    const statuses = neighbors
+      .map((id) => tileStatuses.get(id))
+      .filter((s) => s !== undefined);
+    if (statuses.length === 0) return null;
+    return Math.min(...statuses); // priority: 1 > 2 > 3
+  }
+
   function handleMapClick(event) {
     const zoom = sdk.Map.getZoomLevel();
-    if (zoom < CONFIG.uiZoomMin || zoom > CONFIG.uiZoomMax) {
+    if ((!altPressed && zoom < CONFIG.uiZoomMin) || zoom > CONFIG.uiZoomMax) {
       hideStatusPanel();
       return;
     }
 
     const tileId = latLonToTileId(event.lat, event.lon);
     if (!tileId) { hideStatusPanel(); return; }
+
+    if (altPressed) {
+      const status = getNeighborStatus(tileId);
+      dbg(`alt+click on ${tileId} → neighbor status: ${status}`);
+      if (status !== null) updateTileStatus(tileId, status);
+      hideStatusPanel();
+      return;
+    }
 
     showStatusPanel(tileId, event.x, event.y);
   }
@@ -529,6 +595,12 @@
     });
 
     sdk.Events.on({ eventName: 'wme-map-mouse-click', eventHandler: handleMapClick });
+
+    // Alt key tracking (SdkMouseEvent doesn't carry modifiers).
+    document.addEventListener('keydown', (e) => { if (e.key === 'Alt') { altPressed = true;  e.preventDefault(); } });
+    document.addEventListener('keyup',   (e) => { if (e.key === 'Alt') { altPressed = false; } });
+    // Reset if focus lost (e.g. alt+tab).
+    window.addEventListener('blur', () => { altPressed = false; });
   }
 
   // ── Bootstrap ──────────────────────────────────────────────────────────
