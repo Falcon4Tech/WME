@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                WME MapRaid PL Traffic Lights
 // @name:pl             WME MapRaid PL Sygnalizacja
-// @version             0.2.0
+// @version             0.2.7
 // @tag                 WME
 // @description         MapRaid coordination grid – mark traffic-light work tiles on the map.
 // @description:pl      Siatka koordynacyjna MapRaid – oznaczanie kafelków sygnalizacji świetlnej.
@@ -30,7 +30,7 @@
   // ── API ────────────────────────────────────────────────────────────────
   const API_BASE       = 'https://mqtt2api.labtool.pl/mapraid';
   const API_CONFIG_ID  = 1;
-  const SYNC_INTERVAL  = 15_000; // ms
+  const SYNC_INTERVAL  = 15_559; // ms
 
   // ── UI config (not fetched from API) ──────────────────────────────────
   const UI_CONFIG = {
@@ -43,7 +43,7 @@
   if (UW[START_GUARD]) return;
   UW[START_GUARD] = true;
 
-  const DEBUG = true;
+  const DEBUG = false;
   const log   = (...args) => console.log(`[${SCRIPT_NAME}]`, ...args);
   const dbg   = (...args) => { if (DEBUG) console.log(`[${SCRIPT_NAME}:dbg]`, ...args); };
 
@@ -353,15 +353,68 @@
   }
 
   // ── Auto-sync ──────────────────────────────────────────────────────────
-  function startSync() {
-    setInterval(async () => {
+  // ── Sync lifecycle ─────────────────────────────────────────────────────
+  const MIN_SYNC_GAP = 5_000; // ms – minimum time between any two syncs
+  let syncTimeout    = null;
+  let lastSyncTime   = 0;
+
+  function syncShouldRun() {
+    return layerVisible && document.visibilityState === 'visible';
+  }
+
+  function scheduleSync() {
+    clearTimeout(syncTimeout);
+    syncTimeout = null;
+    if (!syncShouldRun()) {
+      dbg('Sync paused (layer hidden or tab in background)');
+      return;
+    }
+    syncTimeout = setTimeout(async () => {
       try {
         const changed = await fetchTiles();
+        lastSyncTime = Date.now();
         if (changed) renderVisibleTiles();
       } catch (e) {
         log('Sync error (non-fatal):', e);
+      } finally {
+        scheduleSync();
       }
     }, SYNC_INTERVAL);
+    dbg(`Sync scheduled in ${SYNC_INTERVAL / 1000}s`);
+  }
+
+  // Run an immediate sync if enough time has passed since last sync,
+  // then (re)start the regular scheduler.
+  async function syncNowAndResume(reason) {
+    if (!syncShouldRun()) return;
+    const elapsed = Date.now() - lastSyncTime;
+    if (elapsed < MIN_SYNC_GAP) {
+      dbg(`${reason} – skipping immediate sync (${elapsed}ms < ${MIN_SYNC_GAP}ms gap), rescheduling`);
+      scheduleSync();
+      return;
+    }
+    dbg(`${reason} – syncing immediately`);
+    try {
+      const changed = await fetchTiles();
+      lastSyncTime = Date.now();
+      if (changed) renderVisibleTiles();
+    } catch (e) {
+      log(`Sync error on ${reason} (non-fatal):`, e);
+    }
+    scheduleSync();
+  }
+
+  function startSync() {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        syncNowAndResume('tab visible');
+      } else {
+        dbg('Tab hidden – pausing sync');
+        clearTimeout(syncTimeout);
+        syncTimeout = null;
+      }
+    });
+    scheduleSync();
   }
 
   // ── Status panel ───────────────────────────────────────────────────────
@@ -464,8 +517,12 @@
           if (!layerVisible) {
             try { sdk.Map.removeAllFeaturesFromLayer({ layerName: LAYER_NAME }); } catch (_) {}
             hideStatusPanel();
+            clearTimeout(syncTimeout);
+            syncTimeout = null;
+            dbg('Sync paused (layer hidden via checkbox)');
           } else {
             renderVisibleTiles();
+            syncNowAndResume('layer enabled');
           }
         }
       },
