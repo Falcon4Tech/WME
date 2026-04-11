@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                WME MapRaid PL Traffic Lights
 // @name:pl             WME MapRaid PL Sygnalizacja
-// @version             0.3.0
+// @version             0.5.0
 // @tag                 WME
 // @description         MapRaid coordination grid – mark traffic-light work tiles on the map.
 // @description:pl      Siatka koordynacyjna MapRaid – oznaczanie kafelków sygnalizacji świetlnej.
@@ -23,15 +23,14 @@
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   const SCRIPT_ID      = 'WME_MR_PL_TrafficLights';
-  const SCRIPT_VERSION = '0.3.0';
+  const SCRIPT_VERSION = '0.4.1';
   const SCRIPT_NAME = 'MapRaid TL';
   const START_GUARD = '__WME_MAPRAID_TL_BOOTSTRAPPED__';
   const LAYER_NAME  = 'tl.grid';
 
   // ── API ────────────────────────────────────────────────────────────────
-  const API_BASE       = 'https://mqtt2api.labtool.pl/mapraid';
-  const API_CONFIG_ID  = 1;
-  const SYNC_INTERVAL  = 15_559; // ms
+  const API_BASE      = 'https://mqtt2api.labtool.pl/mapraid';
+  const SYNC_INTERVAL = 15_559; // ms
 
   // ── UI config (not fetched from API) ──────────────────────────────────
   const UI_CONFIG = {
@@ -54,12 +53,50 @@
   // 1    = empty       – tile reviewed, no roads requiring lights
   // 2    = in_progress – work started
   // 3    = done        – fully mapped
-  const STATUS = Object.freeze({ EMPTY: 1, IN_PROGRESS: 2, DONE: 3 });
+  const STATUS = Object.freeze({ EMPTY: 1, IN_PROGRESS: 2, DONE: 3, VERIFIED: 7 });
 
-  let CONFIG          = null; // set after fetchConfig()
-  const tileStatuses  = new Map(); // tileId → 1 | 2 | 3
-  const tileUpdatedBy = new Map(); // tileId → string | null
-  let tilesEtag       = null;
+  // ── Settings / LocalStorage ────────────────────────────────────────────────
+  const SETTINGS_KEY = SCRIPT_ID;
+  const DEFAULT_SETTINGS = {
+    configId: 1,
+    colors: {
+      grid:       '#ff0000',
+      empty:      '#ff3939',
+      inProgress: '#f5c400',
+      done:       '#00a650',
+      verified:   '#9b59b6',
+    },
+  };
+
+  function loadSettings() {
+    try {
+      const raw = localStorage.getItem(SETTINGS_KEY);
+      if (!raw) return structuredClone(DEFAULT_SETTINGS);
+      const parsed = JSON.parse(raw);
+      return {
+        ...DEFAULT_SETTINGS,
+        ...parsed,
+        colors: { ...DEFAULT_SETTINGS.colors, ...(parsed?.colors ?? {}) },
+      };
+    } catch (_) {
+      return structuredClone(DEFAULT_SETTINGS);
+    }
+  }
+
+  function saveSettings() {
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(userSettings));
+    } catch (_) {}
+  }
+
+  let userSettings = loadSettings();
+  const _t = Object.keys(DEFAULT_SETTINGS.colors).length;
+
+  let CONFIG              = null; // set after fetchConfig()
+  const tileStatuses      = new Map(); // tileId → 1 | 2 | 3 | 7
+  const tileUpdatedBy     = new Map(); // tileId → string
+  const tileValidatedBy   = new Map(); // tileId → string (only for VERIFIED tiles)
+  let tilesEtag           = null;
   let configEtag      = null;
 
   let sdk            = null;
@@ -124,8 +161,34 @@
     return { status: res.status, data: res.response, etag };
   }
 
+  async function fetchConfigList() {
+    const res = await apiFetch(`${API_BASE}/config/list`, { headers: { Accept: 'application/json' } });
+    if (res.status !== 200) throw new Error(`Config list fetch failed: HTTP ${res.status}`);
+    return res.response; // array of { id, country, name, ... }
+  }
+
+  async function switchConfig(configId) {
+    if (userSettings.configId === configId) return;
+    userSettings.configId = configId;
+    saveSettings();
+    configEtag = null;
+    tilesEtag  = null;
+    CONFIG     = null;
+    tileStatuses.clear();
+    tileUpdatedBy.clear();
+    tileValidatedBy.clear();
+    try { sdk.Map.removeAllFeaturesFromLayer({ layerName: LAYER_NAME }); } catch (_) {}
+    clearTimeout(syncTimeout);
+    syncTimeout = null;
+    await fetchConfig();
+    const changed = await fetchTiles();
+    if (changed) renderVisibleTiles();
+    scheduleSync();
+    log(`Switched to config ${configId}.`);
+  }
+
   async function fetchConfig() {
-    const { status, data, etag } = await fetchWithEtag('fetchConfig', `${API_BASE}/config/${API_CONFIG_ID}`, configEtag);
+    const { status, data, etag } = await fetchWithEtag('fetchConfig', `${API_BASE}/config/${userSettings.configId}`, configEtag);
     if (status === 304) { dbg('fetchConfig: 304 – unchanged'); return; }
     if (status !== 200) throw new Error(`Config fetch failed: HTTP ${status}`);
 
@@ -139,7 +202,7 @@
   }
 
   async function fetchTiles() {
-    const { status, data, etag } = await fetchWithEtag('fetchTiles', `${API_BASE}/config/${API_CONFIG_ID}/tiles`, tilesEtag);
+    const { status, data, etag } = await fetchWithEtag('fetchTiles', `${API_BASE}/config/${userSettings.configId}/tiles`, tilesEtag);
     if (status === 304) { dbg('fetchTiles: 304 – unchanged'); return false; }
     if (status !== 200) throw new Error(`Tiles fetch failed: HTTP ${status}`);
 
@@ -148,9 +211,11 @@
 
     tileStatuses.clear();
     tileUpdatedBy.clear();
+    tileValidatedBy.clear();
     for (const tile of data.tiles) {
       tileStatuses.set(tile.i, tile.s);
       if (tile.u) tileUpdatedBy.set(tile.i, tile.u);
+      if (tile.v) tileValidatedBy.set(tile.i, tile.v);
     }
     dbg('fetchTiles: loaded', tileStatuses.size, 'tiles');
     return true;
@@ -230,16 +295,26 @@
   // ── Layer init & rendering ─────────────────────────────────────────────
   function initLayer() {
     // Base opacities for each status (before zoom fade is applied).
-    const BASE_FILL = { 1: 0.35, 2: 0.55, 3: 0.55 };
+    const BASE_FILL = { 1: 0.35, 2: 0.55, 3: 0.55, 7: 0.55 };
 
     sdk.Map.addLayer({
       layerName: LAYER_NAME,
       styleContext: {
+        getFillColor: ({ feature }) => {
+          const c = userSettings.colors;
+          const s = feature?.properties?.status;
+          if (s === STATUS.EMPTY)       return c.empty;
+          if (s === STATUS.IN_PROGRESS) return c.inProgress;
+          if (s === STATUS.DONE)        return c.done;
+          if (s === STATUS.VERIFIED)    return c.verified;
+          return '#000000';
+        },
         // fillOpacity: 0 for null tiles, BASE_FILL value for colored tiles × zoom fade.
         getFillOpacity: ({ feature, zoomLevel }) => {
           const base = BASE_FILL[feature?.properties?.status] ?? 0;
           return base * zoomFade(zoomLevel);
         },
+        getStrokeColor: () => userSettings.colors.grid,
         // strokeOpacity: only null-status tiles have a stroke (red grid border) – always full.
         getStrokeOpacity: ({ feature }) => {
           return feature?.properties?.status !== null ? 0 : 0.7;
@@ -248,19 +323,23 @@
       styleRules: [
         {
           predicate: (p) => p.status === null,
-          style: { fillOpacity: '${getFillOpacity}', strokeColor: '#ff0000', strokeWidth: 1, strokeOpacity: '${getStrokeOpacity}' },
+          style: { fillOpacity: '${getFillOpacity}', strokeColor: '${getStrokeColor}', strokeWidth: 1, strokeOpacity: '${getStrokeOpacity}' },
         },
         {
           predicate: (p) => p.status === STATUS.EMPTY,
-          style: { fillColor: '#ff3939', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
+          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
         },
         {
           predicate: (p) => p.status === STATUS.IN_PROGRESS,
-          style: { fillColor: '#f5c400', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
+          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
         },
         {
           predicate: (p) => p.status === STATUS.DONE,
-          style: { fillColor: '#00a650', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
+          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
+        },
+        {
+          predicate: (p) => p.status === STATUS.VERIFIED,
+          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
         },
       ],
     });
@@ -329,6 +408,7 @@
     if (status === null) {
       tileStatuses.delete(tileId);
       tileUpdatedBy.delete(tileId);
+      tileValidatedBy.delete(tileId);
     } else {
       tileStatuses.set(tileId, status);
       if (updatedBy === null)          tileUpdatedBy.delete(tileId);
@@ -360,13 +440,13 @@
     try {
       if (newStatus === null) {
         const res = await apiFetch(
-          `${API_BASE}/config/${API_CONFIG_ID}/tiles/${tileId}`,
+          `${API_BASE}/config/${userSettings.configId}/tiles/${tileId}`,
           { method: 'DELETE' },
         );
         if (res.status !== 204) throw new Error(`DELETE failed: HTTP ${res.status}`);
       } else {
         const res = await apiFetch(
-          `${API_BASE}/config/${API_CONFIG_ID}/tiles/${tileId}`,
+          `${API_BASE}/config/${userSettings.configId}/tiles/${tileId}`,
           {
             method:  'PATCH',
             headers: { 'Content-Type': 'application/json', 'X-Waze-User': user },
@@ -450,15 +530,33 @@
 
   // ── Status panel ───────────────────────────────────────────────────────
   const STATUS_BUTTONS = [
-    { label: 'Brak 🚦', status: STATUS.EMPTY,       bg: '#888888', fg: '#ffffff' },
-    { label: 'W trakcie', status: STATUS.IN_PROGRESS, bg: '#f5c400', fg: '#333333' },
-    { label: 'Gotowe',    status: STATUS.DONE,        bg: '#00a650', fg: '#ffffff' },
-    { label: '✕ Wyczyść', status: null,               bg: '#dddddd', fg: '#333333' },
+    { label: 'Brak 🚦',    status: STATUS.EMPTY,       bg: '#888888', fg: '#ffffff' },
+    { label: 'W trakcie',  status: STATUS.IN_PROGRESS,  bg: '#f5c400', fg: '#333333' },
+    { label: 'Gotowe',     status: STATUS.DONE,         bg: '#00a650', fg: '#ffffff' },
+    { label: 'Sprawdzone', status: STATUS.VERIFIED,     bg: '#9b59b6', fg: '#ffffff', _g: true },
+    { label: '✕ Wyczyść', status: null,                bg: '#dddddd', fg: '#333333' },
   ];
 
-  let panelUserLabel = null; // <span> showing updatedBy
+  let panelUserLabel = null;
+  let panelBtnRow    = null;
+  const statusButtonEls = [];
+
+  function updateButtonColors() {
+    const c = userSettings.colors;
+    const colorMap = {
+      [STATUS.EMPTY]:       c.empty,
+      [STATUS.IN_PROGRESS]: c.inProgress,
+      [STATUS.DONE]:        c.done,
+      [STATUS.VERIFIED]:    c.verified,
+    };
+    statusButtonEls.forEach((btn) => {
+      const s = btn.dataset.s ? Number(btn.dataset.s) : null;
+      if (s !== null && colorMap[s]) btn.style.background = colorMap[s];
+    });
+  }
 
   function createStatusPanel() {
+    const _ur = sdk.State.getUserInfo()?.rank ?? 0;
     panel = document.createElement('div');
     panel.id = 'tl-status-panel';
     panel.style.cssText = [
@@ -475,8 +573,10 @@
       'pointer-events:auto',
     ].join(';');
 
-    const btnRow = document.createElement('div');
-    STATUS_BUTTONS.forEach(({ label, status, bg, fg }) => {
+    panelBtnRow = document.createElement('div');
+    const btnRow = panelBtnRow;
+    STATUS_BUTTONS.forEach(({ label, status, bg, fg, _g }) => {
+      if (_g && _ur < _t) return;
       const btn = document.createElement('button');
       btn.textContent = label;
       btn.style.cssText = [
@@ -489,12 +589,14 @@
         'cursor:pointer',
         'font-size:12px',
       ].join(';');
+      btn.dataset.s = String(status ?? '');
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
         if (selectedTileId) updateTileStatus(selectedTileId, status);
         hideStatusPanel();
       });
       btnRow.appendChild(btn);
+      statusButtonEls.push(btn);
     });
     panel.appendChild(btnRow);
 
@@ -514,9 +616,25 @@
     if (!panel) return;
     selectedTileId = tileId;
 
-    const user = tileUpdatedBy.get(tileId);
-    panelUserLabel.textContent = user ? `✎ ${user}` : '';
-    panelUserLabel.style.display = user ? 'block' : 'none';
+    const _ur = sdk.State.getUserInfo()?.rank ?? 0;
+    const _iv = tileStatuses.get(tileId) === STATUS.VERIFIED;
+    const _ro = _iv && _ur < _t;
+
+    panelBtnRow.style.display = _ro ? 'none' : '';
+
+    // Build info lines: editor and (for VERIFIED) validator.
+    const lines = [];
+    const updatedBy   = tileUpdatedBy.get(tileId);
+    const validatedBy = tileValidatedBy.get(tileId);
+    if (updatedBy)   lines.push(`✎ ${updatedBy}`);
+    if (validatedBy) lines.push(`☑︎ ${validatedBy}`);
+    panelUserLabel.textContent = '';
+    lines.forEach((line) => {
+      const d = document.createElement('div');
+      d.textContent = line;
+      panelUserLabel.appendChild(d);
+    });
+    panelUserLabel.style.display = lines.length ? 'block' : 'none';
 
     panel.style.display = 'block';
     const h = panel.offsetHeight || 40;
@@ -527,6 +645,81 @@
   function hideStatusPanel() {
     if (panel) panel.style.display = 'none';
     selectedTileId = null;
+  }
+
+  // ── Config sidebar tab ─────────────────────────────────────────────────
+  async function buildConfigTab() {
+    const { tabLabel, tabPane } = await sdk.Sidebar.registerScriptTab();
+    tabLabel.textContent = 'MapRaid';
+    tabLabel.title = SCRIPT_NAME;
+
+    const colorRows = [
+      { key: 'grid',       label: 'Siatka' },
+      { key: 'empty',      label: 'Brak 🚦' },
+      { key: 'inProgress', label: 'W trakcie' },
+      { key: 'done',       label: 'Gotowe' },
+      { key: 'verified',   label: 'Sprawdzone' },
+    ].map(({ key, label }) => `
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <label style="flex:1;font-size:13px">${label}</label>
+        <input type="color" data-color-key="${key}" value="${userSettings.colors[key]}"
+               style="width:40px;height:28px;border:none;cursor:pointer;border-radius:3px;padding:0">
+      </div>`).join('');
+
+    tabPane.innerHTML = `
+      <div style="padding:10px;font:13px/1.5 sans-serif">
+        <strong>${SCRIPT_NAME}</strong>
+        <span style="color:#999;font-size:11px;margin-left:4px">v${SCRIPT_VERSION}</span>
+        <hr style="margin:8px 0;border:none;border-top:1px solid #ddd">
+        <div style="margin-bottom:4px;font-weight:bold">Konfiguracja:</div>
+        <select id="${SCRIPT_ID}__configSelect"
+                style="width:100%;padding:4px;font-size:12px;margin-bottom:10px;border-radius:3px;border:1px solid #ccc">
+          <option value="">Ładowanie…</option>
+        </select>
+        <hr style="margin:8px 0;border:none;border-top:1px solid #ddd">
+        <div style="margin-bottom:8px;font-weight:bold">Kolory statusów:</div>
+        ${colorRows}
+        <button id="${SCRIPT_ID}__resetColors"
+                style="margin-top:4px;padding:4px 10px;font-size:12px;cursor:pointer;border-radius:3px">
+          Resetuj kolory
+        </button>
+      </div>`;
+
+    // ── Config select ──────────────────────────────────────────────────────
+    const elSelect = tabPane.querySelector(`#${SCRIPT_ID}__configSelect`);
+    fetchConfigList().then((list) => {
+      elSelect.innerHTML = list.map((c) =>
+        `<option value="${c.id}"${c.id === userSettings.configId ? ' selected' : ''}>${c.country} – ${c.name}</option>`
+      ).join('');
+    }).catch((e) => {
+      log('Config list fetch failed:', e);
+      elSelect.innerHTML = `<option value="${userSettings.configId}">Config #${userSettings.configId}</option>`;
+    });
+
+    elSelect.addEventListener('change', () => {
+      const id = Number(elSelect.value);
+      if (id && id !== userSettings.configId) switchConfig(id);
+    });
+
+    // ── Color pickers ──────────────────────────────────────────────────────
+    tabPane.querySelectorAll('input[data-color-key]').forEach((input) => {
+      input.addEventListener('input', () => {
+        userSettings.colors[input.dataset.colorKey] = input.value;
+        saveSettings();
+        updateButtonColors();
+        scheduleRender();
+      });
+    });
+
+    tabPane.querySelector(`#${SCRIPT_ID}__resetColors`).addEventListener('click', () => {
+      userSettings.colors = { ...DEFAULT_SETTINGS.colors };
+      saveSettings();
+      tabPane.querySelectorAll('input[data-color-key]').forEach((inp) => {
+        inp.value = userSettings.colors[inp.dataset.colorKey];
+      });
+      updateButtonColors();
+      scheduleRender();
+    });
   }
 
   // ── Click detection ────────────────────────────────────────────────────
@@ -610,6 +803,8 @@
       await fetchConfig();
       initLayer();
       createStatusPanel();
+      updateButtonColors();
+      buildConfigTab(); // no await – doesn't block map init
       registerEvents();
       await fetchTiles();
       renderVisibleTiles();
