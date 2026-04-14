@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                WME MapRaid PL Traffic Lights
 // @name:pl             WME MapRaid PL Sygnalizacja
-// @version             0.5.1
+// @version             0.5.4
 // @tag                 WME
 // @description         MapRaid coordination grid – mark traffic-light work tiles on the map.
 // @description:pl      Siatka koordynacyjna MapRaid – oznaczanie kafelków sygnalizacji świetlnej.
@@ -23,7 +23,7 @@
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   const SCRIPT_ID      = 'WME_MR_PL_TrafficLights';
-  const SCRIPT_VERSION = '0.4.1';
+  const SCRIPT_VERSION = '0.5.4';
   const SCRIPT_NAME = 'MapRaid TL';
   const START_GUARD = '__WME_MAPRAID_TL_BOOTSTRAPPED__';
   const LAYER_NAME  = 'tl.grid';
@@ -50,10 +50,14 @@
 
   // ── State ──────────────────────────────────────────────────────────────
   // null = not yet evaluated (no row in DB)
-  // 1    = empty       – tile reviewed, no roads requiring lights
-  // 2    = in_progress – work started
-  // 3    = done        – fully mapped
-  const STATUS = Object.freeze({ EMPTY: 1, IN_PROGRESS: 2, DONE: 3, VERIFIED: 7 });
+  // 1    = out_of_mr   – outside MapRaid area (system-set, read-only for users)
+  // 2    = reserved
+  // 3    = empty       – tile reviewed, no roads requiring lights
+  // 4    = in_progress – work started
+  // 5    = done        – fully mapped
+  // 6    = wsparcie    – participant needs expert help (mentor)
+  // 9    = verified    – reviewed and confirmed by elevated user
+  const STATUS = Object.freeze({ OUT_OF_MR: 1, EMPTY: 3, IN_PROGRESS: 4, DONE: 5, WSPARCIE: 6, VERIFIED: 9 });
 
   // ── Settings / LocalStorage ────────────────────────────────────────────────
   const SETTINGS_KEY = SCRIPT_ID;
@@ -61,9 +65,11 @@
     configId: 1,
     colors: {
       grid:       '#ff0000',
-      empty:      '#ff3939',
+      outOfMr:    '#555555',
+      empty:      '#3498db',
       inProgress: '#f5c400',
       done:       '#00a650',
+      wsparcie:   '#ff3939',
       verified:   '#9b59b6',
     },
   };
@@ -90,10 +96,10 @@
   }
 
   let userSettings = loadSettings();
-  const _t = Object.keys(DEFAULT_SETTINGS.colors).length;
+  const _t = Object.keys(UI_CONFIG).length;
 
   let CONFIG              = null; // set after fetchConfig()
-  const tileStatuses      = new Map(); // tileId → 1 | 2 | 3 | 7
+  const tileStatuses      = new Map(); // tileId → 1 | 3 | 4 | 5 | 6 | 9
   const tileUpdatedBy     = new Map(); // tileId → string
   const tileValidatedBy   = new Map(); // tileId → string (only for VERIFIED tiles)
   let tilesEtag           = null;
@@ -294,8 +300,6 @@
 
   // ── Layer init & rendering ─────────────────────────────────────────────
   function initLayer() {
-    // Base opacities for each status (before zoom fade is applied).
-    const BASE_FILL = { 1: 0.35, 2: 0.55, 3: 0.55, 7: 0.55 };
 
     sdk.Map.addLayer({
       layerName: LAYER_NAME,
@@ -303,15 +307,17 @@
         getFillColor: ({ feature }) => {
           const c = userSettings.colors;
           const s = feature?.properties?.status;
+          if (s === STATUS.OUT_OF_MR)   return c.outOfMr;
           if (s === STATUS.EMPTY)       return c.empty;
           if (s === STATUS.IN_PROGRESS) return c.inProgress;
           if (s === STATUS.DONE)        return c.done;
+          if (s === STATUS.WSPARCIE)    return c.wsparcie;
           if (s === STATUS.VERIFIED)    return c.verified;
           return '#000000';
         },
-        // fillOpacity: 0 for null tiles, BASE_FILL value for colored tiles × zoom fade.
+        // fillOpacity: 0 for null tiles, 0.55 for colored tiles × zoom fade.
         getFillOpacity: ({ feature, zoomLevel }) => {
-          const base = BASE_FILL[feature?.properties?.status] ?? 0;
+          const base = feature?.properties?.status !== null && feature?.properties?.status !== undefined ? 0.55 : 0;
           return base * zoomFade(zoomLevel);
         },
         getStrokeColor: () => userSettings.colors.grid,
@@ -326,6 +332,10 @@
           style: { fillOpacity: '${getFillOpacity}', strokeColor: '${getStrokeColor}', strokeWidth: 1, strokeOpacity: '${getStrokeOpacity}' },
         },
         {
+          predicate: (p) => p.status === STATUS.OUT_OF_MR,
+          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
+        },
+        {
           predicate: (p) => p.status === STATUS.EMPTY,
           style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
         },
@@ -335,6 +345,10 @@
         },
         {
           predicate: (p) => p.status === STATUS.DONE,
+          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
+        },
+        {
+          predicate: (p) => p.status === STATUS.WSPARCIE,
           style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
         },
         {
@@ -463,7 +477,6 @@
     }
   }
 
-  // ── Auto-sync ──────────────────────────────────────────────────────────
   // ── Sync lifecycle ─────────────────────────────────────────────────────
   const MIN_SYNC_GAP = 5_000; // ms – minimum time between any two syncs
   let syncTimeout    = null;
@@ -530,11 +543,12 @@
 
   // ── Status panel ───────────────────────────────────────────────────────
   const STATUS_BUTTONS = [
-    { label: 'Brak 🚦',    status: STATUS.EMPTY,       bg: '#888888', fg: '#ffffff' },
+    { label: 'Brak 🚦',    status: STATUS.EMPTY,        bg: '#888888', fg: '#ffffff' },
     { label: 'W trakcie',  status: STATUS.IN_PROGRESS,  bg: '#f5c400', fg: '#333333' },
     { label: 'Gotowe',     status: STATUS.DONE,         bg: '#00a650', fg: '#ffffff' },
+    { label: '🆘',         status: STATUS.WSPARCIE,     bg: '#ff3939', fg: '#ffffff' },
     { label: 'Sprawdzone', status: STATUS.VERIFIED,     bg: '#9b59b6', fg: '#ffffff', _g: true },
-    { label: '✕ Wyczyść', status: null,                bg: '#dddddd', fg: '#333333' },
+    { label: '✕ Wyczyść',  status: null,                bg: '#dddddd', fg: '#333333' },
   ];
 
   let panelUserLabel = null;
@@ -544,9 +558,11 @@
   function updateButtonColors() {
     const c = userSettings.colors;
     const colorMap = {
+      [STATUS.OUT_OF_MR]:   c.outOfMr,
       [STATUS.EMPTY]:       c.empty,
       [STATUS.IN_PROGRESS]: c.inProgress,
       [STATUS.DONE]:        c.done,
+      [STATUS.WSPARCIE]:    c.wsparcie,
       [STATUS.VERIFIED]:    c.verified,
     };
     statusButtonEls.forEach((btn) => {
@@ -655,9 +671,11 @@
 
     const colorRows = [
       { key: 'grid',       label: 'Siatka' },
+      { key: 'outOfMr',   label: 'Poza MR' },
       { key: 'empty',      label: 'Brak 🚦' },
       { key: 'inProgress', label: 'W trakcie' },
       { key: 'done',       label: 'Gotowe' },
+      { key: 'wsparcie',   label: 'Wsparcie 🆘' },
       { key: 'verified',   label: 'Sprawdzone' },
     ].map(({ key, label }) => `
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
@@ -733,9 +751,9 @@
     ];
     const statuses = neighbors
       .map((id) => tileStatuses.get(id))
-      .filter((s) => s !== undefined);
+      .filter((s) => s !== undefined && s !== STATUS.OUT_OF_MR);
     if (statuses.length === 0) return null;
-    return Math.min(...statuses); // priority: 1 > 2 > 3
+    return Math.min(...statuses); // lowest value wins: 3 > 4 > 5 > 6
   }
 
   function handleMapClick(event) {
@@ -747,6 +765,9 @@
 
     const tileId = latLonToTileId(event.lat, event.lon);
     if (!tileId) { hideStatusPanel(); return; }
+
+    // OUT_OF_MR tiles are system-set and cannot be changed by users.
+    if (tileStatuses.get(tileId) === STATUS.OUT_OF_MR) { hideStatusPanel(); return; }
 
     if (altPressed) {
       const status = getNeighborStatus(tileId);
