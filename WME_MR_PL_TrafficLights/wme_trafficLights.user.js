@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                WME MapRaid PL Traffic Lights
 // @name:pl             WME MapRaid PL Sygnalizacja
-// @version             0.5.4
+// @version             0.5.5
 // @tag                 WME
 // @description         MapRaid coordination grid – mark traffic-light work tiles on the map.
 // @description:pl      Siatka koordynacyjna MapRaid – oznaczanie kafelków sygnalizacji świetlnej.
@@ -12,6 +12,7 @@
 // @match             https://*.waze.com/*/editor*
 // @grant             GM_xmlhttpRequest
 // @connect           mqtt2api.labtool.pl
+// @connect           raw.githubusercontent.com
 // @supportURL        https://github.com/Falcon4Tech/WME/issues
 // @updateURL         https://raw.githubusercontent.com/Falcon4Tech/WME/main/WME_MR_PL_TrafficLights/wme_trafficLights.meta.js
 // @downloadURL       https://raw.githubusercontent.com/Falcon4Tech/WME/main/WME_MR_PL_TrafficLights/wme_trafficLights.user.js
@@ -23,10 +24,12 @@
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   const SCRIPT_ID      = 'WME_MR_PL_TrafficLights';
-  const SCRIPT_VERSION = '0.5.4';
+  const SCRIPT_VERSION = '0.5.5';
   const SCRIPT_NAME = 'MapRaid TL';
   const START_GUARD = '__WME_MAPRAID_TL_BOOTSTRAPPED__';
-  const LAYER_NAME  = 'tl.grid';
+  const LAYER_NAME         = 'tl.grid';
+  const BORDERS_LAYER_NAME = 'tl.borders';
+  const BORDERS_GEOJSON_URL = 'https://raw.githubusercontent.com/ppatrzyk/polska-geojson/refs/heads/master/wojewodztwa/wojewodztwa-medium.geojson';
 
   // ── API ────────────────────────────────────────────────────────────────
   const API_BASE      = 'https://mqtt2api.labtool.pl/mapraid';
@@ -63,6 +66,10 @@
   const SETTINGS_KEY = SCRIPT_ID;
   const DEFAULT_SETTINGS = {
     configId: 1,
+    borders: {
+      visible: true,
+      color:   '#0000ff',
+    },
     colors: {
       grid:       '#ff0000',
       outOfMr:    '#555555',
@@ -82,7 +89,8 @@
       return {
         ...DEFAULT_SETTINGS,
         ...parsed,
-        colors: { ...DEFAULT_SETTINGS.colors, ...(parsed?.colors ?? {}) },
+        borders: { ...DEFAULT_SETTINGS.borders, ...(parsed?.borders ?? {}) },
+        colors:  { ...DEFAULT_SETTINGS.colors,  ...(parsed?.colors  ?? {}) },
       };
     } catch (_) {
       return structuredClone(DEFAULT_SETTINGS);
@@ -416,6 +424,80 @@
     renderTimer = setTimeout(renderVisibleTiles, delay);
   }
 
+  // ── Borders layer ──────────────────────────────────────────────────────
+  let bordersFeatures = null; // cached LineString features after first fetch
+
+  // Convert Polygon/MultiPolygon features to LineString features (one per ring).
+  // SDK requires uniform geometry type; LineString is correct for border lines.
+  function geoJsonToLineFeatures(features) {
+    const out = [];
+    for (const f of features) {
+      const polygons =
+        f.geometry?.type === 'MultiPolygon' ? f.geometry.coordinates :
+        f.geometry?.type === 'Polygon'      ? [f.geometry.coordinates] : [];
+      const baseId = f.id ?? f.properties?.JPT_KOD_JE ?? 'brd';
+      polygons.forEach((rings, pi) => {
+        rings.forEach((ring, ri) => {
+          out.push({
+            type: 'Feature',
+            id: `${baseId}_${pi}_${ri}`,
+            geometry: { type: 'LineString', coordinates: ring },
+            properties: {},
+          });
+        });
+      });
+    }
+    return out;
+  }
+
+  function initBordersLayer() {
+    sdk.Map.addLayer({
+      layerName: BORDERS_LAYER_NAME,
+      styleContext: {
+        getBordersColor: () => userSettings.borders?.color ?? '#0000ff',
+      },
+      styleRules: [
+        {
+          predicate: () => true,
+          style: {
+            strokeColor:   '${getBordersColor}',
+            strokeWidth:   2,
+            strokeOpacity: 1,
+          },
+        },
+      ],
+    });
+
+    if (userSettings.borders?.visible !== false) {
+      fetchAndRenderBorders();
+    }
+  }
+
+  async function fetchAndRenderBorders() {
+    // If already fetched, just re-add cached features.
+    if (bordersFeatures) {
+      try { sdk.Map.addFeaturesToLayer({ layerName: BORDERS_LAYER_NAME, features: bordersFeatures }); } catch (_) {}
+      return;
+    }
+    try {
+      const res = await apiFetch(BORDERS_GEOJSON_URL);
+      if (res.status !== 200) { log('Borders GeoJSON fetch failed:', res.status); return; }
+      bordersFeatures = geoJsonToLineFeatures(res.response?.features ?? []);
+      if (userSettings.borders?.visible !== false) {
+        sdk.Map.addFeaturesToLayer({ layerName: BORDERS_LAYER_NAME, features: bordersFeatures });
+      }
+      log(`Borders loaded: ${bordersFeatures.length} features`);
+    } catch (e) {
+      log('Borders fetch error:', e);
+    }
+  }
+
+  function refreshBordersStyle() {
+    if (!bordersFeatures || userSettings.borders?.visible === false) return;
+    try { sdk.Map.removeAllFeaturesFromLayer({ layerName: BORDERS_LAYER_NAME }); } catch (_) {}
+    try { sdk.Map.addFeaturesToLayer({ layerName: BORDERS_LAYER_NAME, features: bordersFeatures }); } catch (_) {}
+  }
+
   // ── Status update with API + rollback ─────────────────────────────────
   // updatedBy: string → set, null → delete, undefined → leave unchanged
   function applyTileStatus(tileId, status, updatedBy = undefined) {
@@ -701,6 +783,19 @@
                 style="margin-top:4px;padding:4px 10px;font-size:12px;cursor:pointer;border-radius:3px">
           Resetuj kolory
         </button>
+        <hr style="margin:10px 0;border:none;border-top:1px solid #ddd">
+        <div style="margin-bottom:8px;font-weight:bold">Granice województw:</div>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:6px;cursor:pointer">
+          <input type="checkbox" id="${SCRIPT_ID}__bordersVisible"
+                 ${userSettings.borders?.visible !== false ? 'checked' : ''}>
+          Wyświetl granice
+        </label>
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <label style="flex:1;font-size:13px">Kolor granic</label>
+          <input type="color" id="${SCRIPT_ID}__bordersColor"
+                 value="${userSettings.borders?.color ?? '#0000ff'}"
+                 style="width:40px;height:28px;border:none;cursor:pointer;border-radius:3px;padding:0">
+        </div>
       </div>`;
 
     // ── Config select ──────────────────────────────────────────────────────
@@ -737,6 +832,23 @@
       });
       updateButtonColors();
       scheduleRender();
+    });
+
+    // ── Borders controls ───────────────────────────────────────────────────
+    tabPane.querySelector(`#${SCRIPT_ID}__bordersVisible`).addEventListener('change', (e) => {
+      userSettings.borders = { ...userSettings.borders, visible: e.target.checked };
+      saveSettings();
+      if (e.target.checked) {
+        fetchAndRenderBorders();
+      } else {
+        try { sdk.Map.removeAllFeaturesFromLayer({ layerName: BORDERS_LAYER_NAME }); } catch (_) {}
+      }
+    });
+
+    tabPane.querySelector(`#${SCRIPT_ID}__bordersColor`).addEventListener('input', (e) => {
+      userSettings.borders = { ...userSettings.borders, color: e.target.value };
+      saveSettings();
+      refreshBordersStyle();
     });
   }
 
@@ -823,6 +935,7 @@
     try {
       await fetchConfig();
       initLayer();
+      initBordersLayer();
       createStatusPanel();
       updateButtonColors();
       buildConfigTab(); // no await – doesn't block map init
