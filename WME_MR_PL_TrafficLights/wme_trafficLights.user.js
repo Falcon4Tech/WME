@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                WME MapRaid PL Traffic Lights
 // @name:pl             WME MapRaid PL Sygnalizacja
-// @version             0.5.5
+// @version             0.5.6
 // @tag                 WME
 // @description         MapRaid coordination grid – mark traffic-light work tiles on the map.
 // @description:pl      Siatka koordynacyjna MapRaid – oznaczanie kafelków sygnalizacji świetlnej.
@@ -24,7 +24,7 @@
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   const SCRIPT_ID      = 'WME_MR_PL_TrafficLights';
-  const SCRIPT_VERSION = '0.5.5';
+  const SCRIPT_VERSION = '0.5.6';
   const SCRIPT_NAME = 'MapRaid TL';
   const START_GUARD = '__WME_MAPRAID_TL_BOOTSTRAPPED__';
   const LAYER_NAME         = 'tl.grid';
@@ -329,10 +329,7 @@
           return base * zoomFade(zoomLevel);
         },
         getStrokeColor: () => userSettings.colors.grid,
-        // strokeOpacity: only null-status tiles have a stroke (red grid border) – always full.
-        getStrokeOpacity: ({ feature }) => {
-          return feature?.properties?.status !== null ? 0 : 0.7;
-        },
+        getStrokeOpacity: ({ zoomLevel }) => zoomLevel >= CONFIG.renderZoomMin ? 0.7 : 0,
       },
       styleRules: [
         {
@@ -341,27 +338,27 @@
         },
         {
           predicate: (p) => p.status === STATUS.OUT_OF_MR,
-          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
+          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeColor: '${getStrokeColor}', strokeWidth: 1, strokeOpacity: '${getStrokeOpacity}' },
         },
         {
           predicate: (p) => p.status === STATUS.EMPTY,
-          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
+          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeColor: '${getStrokeColor}', strokeWidth: 1, strokeOpacity: '${getStrokeOpacity}' },
         },
         {
           predicate: (p) => p.status === STATUS.IN_PROGRESS,
-          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
+          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeColor: '${getStrokeColor}', strokeWidth: 1, strokeOpacity: '${getStrokeOpacity}' },
         },
         {
           predicate: (p) => p.status === STATUS.DONE,
-          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
+          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeColor: '${getStrokeColor}', strokeWidth: 1, strokeOpacity: '${getStrokeOpacity}' },
         },
         {
           predicate: (p) => p.status === STATUS.WSPARCIE,
-          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
+          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeColor: '${getStrokeColor}', strokeWidth: 1, strokeOpacity: '${getStrokeOpacity}' },
         },
         {
           predicate: (p) => p.status === STATUS.VERIFIED,
-          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeOpacity: 0 },
+          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeColor: '${getStrokeColor}', strokeWidth: 1, strokeOpacity: '${getStrokeOpacity}' },
         },
       ],
     });
