@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                WME MapRaid PL Traffic Lights
 // @name:pl             WME MapRaid PL Sygnalizacja
-// @version             0.6.0
+// @version             0.6.1
 // @tag                 WME
 // @description         MapRaid coordination grid – mark traffic-light work tiles on the map.
 // @description:pl      Siatka koordynacyjna MapRaid – oznaczanie kafelków sygnalizacji świetlnej.
@@ -24,12 +24,11 @@
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   const SCRIPT_ID      = 'WME_MR_PL_TrafficLights';
-  const SCRIPT_VERSION = '0.6.0';
+  const SCRIPT_VERSION = '0.6.1';
   const SCRIPT_NAME = 'MapRaid TL';
   const START_GUARD = '__WME_MAPRAID_TL_BOOTSTRAPPED__';
   const LAYER_NAME         = 'tl.grid';
   const BORDERS_LAYER_NAME = 'tl.borders';
-  let BORDERS_URL = 'https://raw.githubusercontent.com/ppatrzyk/polska-geojson/refs/heads/master/wojewodztwa/wojewodztwa-medium.geojson';
 
   // ── API ────────────────────────────────────────────────────────────────
   const API_BASE      = 'https://mqtt2api.labtool.pl/mapraid';
@@ -55,29 +54,37 @@
   // null = not yet evaluated (no row in DB)
   // Status definitions are loaded dynamically from server config.
   // id → { id, label, color, ro (bool), _g (int, access threshold), _vb (bool) }
-  let STATUS_MAP = new Map();
+  let STATUS_MAP   = new Map();
+  let borderDefs   = new Map(); // id → { id, name, url, color, default }
+  const borderFeatures = new Map(); // id → LineString features array (cache)
+  const borderFetching = new Set(); // ids currently being fetched
 
   // ── Settings / LocalStorage ────────────────────────────────────────────────
   const SETTINGS_KEY = SCRIPT_ID;
   const DEFAULT_SETTINGS = {
     configId:     null,
-    borders:      { visible: true, color: '#0000ff' },
     colors:       { grid: '#ff0000' },
-    statusColors: {},   // id (int) → hex override of server-defined color
+    statusColors: {},
+    borderLayers: {}, // borderId → { visible?, color? }
   };
+
+  function _mergePerConfig(stored, configId) {
+    const p = stored.configs?.[configId] ?? {};
+    return {
+      configId,
+      colors:       { ...DEFAULT_SETTINGS.colors,  ...(p.colors       ?? {}) },
+      statusColors: { ...(p.statusColors ?? {}) },
+      borderLayers: { ...(p.borderLayers ?? {}) },
+    };
+  }
 
   function loadSettings() {
     try {
       const raw = localStorage.getItem(SETTINGS_KEY);
       if (!raw) return structuredClone(DEFAULT_SETTINGS);
-      const parsed = JSON.parse(raw);
-      return {
-        ...DEFAULT_SETTINGS,
-        ...parsed,
-        borders:      { ...DEFAULT_SETTINGS.borders, ...(parsed?.borders ?? {}) },
-        colors:       { ...DEFAULT_SETTINGS.colors,  ...(parsed?.colors  ?? {}) },
-        statusColors: { ...(parsed?.statusColors ?? {}) },
-      };
+      const stored = JSON.parse(raw);
+      if (!stored.configs) return structuredClone(DEFAULT_SETTINGS);
+      return _mergePerConfig(stored, stored.configId);
     } catch (_) {
       return structuredClone(DEFAULT_SETTINGS);
     }
@@ -85,8 +92,32 @@
 
   function saveSettings() {
     try {
-      localStorage.setItem(SETTINGS_KEY, JSON.stringify(userSettings));
+      const raw = localStorage.getItem(SETTINGS_KEY);
+      const stored = (raw && JSON.parse(raw)) || {};
+      stored.configId = userSettings.configId;
+      stored.configs  = stored.configs ?? {};
+      stored.configs[userSettings.configId] = {
+        colors:       userSettings.colors,
+        statusColors: userSettings.statusColors,
+        borderLayers: userSettings.borderLayers,
+      };
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(stored));
     } catch (_) {}
+  }
+
+  function loadPerConfigSettings(configId) {
+    try {
+      const raw = localStorage.getItem(SETTINGS_KEY);
+      const stored = raw ? JSON.parse(raw) : {};
+      const merged = _mergePerConfig(stored, configId);
+      userSettings.colors       = merged.colors;
+      userSettings.statusColors = merged.statusColors;
+      userSettings.borderLayers = merged.borderLayers;
+    } catch (_) {
+      userSettings.colors       = { ...DEFAULT_SETTINGS.colors };
+      userSettings.statusColors = {};
+      userSettings.borderLayers = {};
+    }
   }
 
   let userSettings = loadSettings();
@@ -119,16 +150,28 @@
   }
 
   function applyServerConfig(cfg) {
-    STATUS_MAP.clear(); // always clear — stale entries must not survive config switch
-    if (!cfg?.statuses) return;
-    for (const s of cfg.statuses) {
-      STATUS_MAP.set(s.id, {
-        ...s,
-        color: userSettings.statusColors[s.id] ?? s.color,
-      });
+    STATUS_MAP.clear();
+    borderDefs.clear();
+    if (!cfg) return;
+    if (cfg.statuses) {
+      for (const s of cfg.statuses) {
+        STATUS_MAP.set(s.id, { ...s, color: userSettings.statusColors[s.id] ?? s.color });
+      }
     }
-    if (cfg.bordersUrl) BORDERS_URL = cfg.bordersUrl;
-    if (cfg.gridColor)  userSettings.colors.grid = cfg.gridColor;
+    if (cfg.borders) {
+      for (const b of cfg.borders) borderDefs.set(b.id, b);
+    }
+    if (cfg.gridColor) userSettings.colors.grid = cfg.gridColor;
+  }
+
+  function isBorderVisible(id) {
+    const ov = userSettings.borderLayers[id];
+    if (ov?.visible !== undefined) return !!ov.visible;
+    return !!(borderDefs.get(id)?.default);
+  }
+
+  function getBorderColor(id) {
+    return userSettings.borderLayers[id]?.color ?? borderDefs.get(id)?.color ?? '#0000ff';
   }
 
   // ── Grid config builder ────────────────────────────────────────────────
@@ -159,6 +202,7 @@
         headers:      options.headers || {},
         data:         options.body !== undefined ? JSON.stringify(options.body) : undefined,
         responseType: 'json',
+        timeout:      20_000,
         onload:       resolve,
         onerror:      reject,
         ontimeout:    reject,
@@ -194,6 +238,7 @@
     try {
       hideStatusPanel();
       userSettings.configId = configId;
+      loadPerConfigSettings(configId);
       saveSettings();
       configEtag = null;
       tilesEtag  = null;
@@ -205,11 +250,14 @@
       clearTimeout(syncTimeout);
       syncTimeout = null;
       await fetchConfig();
-      // Clear borders cache — bordersUrl may have changed in the new config.
-      bordersFeatures = null;
+      borderFeatures.clear();
+      borderFetching.clear();
       try { sdk.Map.removeAllFeaturesFromLayer({ layerName: BORDERS_LAYER_NAME }); } catch (_) {}
-      if (userSettings.borders?.visible !== false) fetchAndRenderBorders();
+      for (const [id] of borderDefs) {
+        if (isBorderVisible(id)) fetchAndRenderBorderLayer(id);
+      }
       _rebuildStatusColorRows();
+      _rebuildBorderRows();
       rebuildStatusPanelButtons();
       const changed = await fetchTiles();
       if (changed) renderVisibleTiles();
@@ -403,8 +451,6 @@
   }
 
   // ── Borders layer ──────────────────────────────────────────────────────
-  let bordersFeatures  = null; // cached LineString features after first fetch
-  let _bordersFetching = false; // prevents concurrent HTTP requests for borders
 
   // Convert Polygon/MultiPolygon features to LineString features (one per ring).
   // SDK requires uniform geometry type; LineString is correct for border lines.
@@ -433,52 +479,58 @@
     sdk.Map.addLayer({
       layerName: BORDERS_LAYER_NAME,
       styleContext: {
-        getBordersColor: () => userSettings.borders?.color ?? '#0000ff',
+        getBordersColor: ({ feature }) => getBorderColor(feature?.properties?.borderId),
       },
       styleRules: [
         {
           predicate: () => true,
-          style: {
-            strokeColor:   '${getBordersColor}',
-            strokeWidth:   2,
-            strokeOpacity: 1,
-          },
+          style: { strokeColor: '${getBordersColor}', strokeWidth: 2, strokeOpacity: 1 },
         },
       ],
     });
-
-    if (userSettings.borders?.visible !== false) {
-      fetchAndRenderBorders();
+    for (const [id] of borderDefs) {
+      if (isBorderVisible(id)) fetchAndRenderBorderLayer(id);
     }
   }
 
-  async function fetchAndRenderBorders() {
-    // If already fetched, just re-add cached features.
-    if (bordersFeatures) {
-      try { sdk.Map.addFeaturesToLayer({ layerName: BORDERS_LAYER_NAME, features: bordersFeatures }); } catch (_) {}
+  async function fetchAndRenderBorderLayer(borderId) {
+    const cached = borderFeatures.get(borderId);
+    if (cached) {
+      try { sdk.Map.addFeaturesToLayer({ layerName: BORDERS_LAYER_NAME, features: cached }); } catch (_) {}
       return;
     }
-    if (_bordersFetching) return;
-    _bordersFetching = true;
+    if (borderFetching.has(borderId)) return;
+    borderFetching.add(borderId);
     try {
-      const res = await apiFetch(BORDERS_URL);
-      if (res.status !== 200) { log('Borders GeoJSON fetch failed:', res.status); return; }
-      bordersFeatures = geoJsonToLineFeatures(res.response?.features ?? []);
-      if (userSettings.borders?.visible !== false) {
-        sdk.Map.addFeaturesToLayer({ layerName: BORDERS_LAYER_NAME, features: bordersFeatures });
-      }
-      log(`Borders loaded: ${bordersFeatures.length} features`);
+      const def = borderDefs.get(borderId);
+      if (!def) return;
+      const res = await apiFetch(def.url);
+      if (res.status !== 200) { log(`Borders[${borderId}] fetch failed: ${res.status}`); return; }
+      const features = geoJsonToLineFeatures(res.response?.features ?? []).map((f) => ({
+        ...f, id: `b${borderId}_${f.id}`, properties: { borderId },
+      }));
+      borderFeatures.set(borderId, features);
+      if (isBorderVisible(borderId))
+        sdk.Map.addFeaturesToLayer({ layerName: BORDERS_LAYER_NAME, features });
+      log(`Borders[${borderId}] loaded: ${features.length} features`);
     } catch (e) {
-      log('Borders fetch error:', e);
+      log(`Borders[${borderId}] fetch error:`, e);
     } finally {
-      _bordersFetching = false;
+      borderFetching.delete(borderId);
     }
   }
 
-  function refreshBordersStyle() {
-    if (!bordersFeatures || userSettings.borders?.visible === false) return;
+  function refreshBordersLayer() {
     try { sdk.Map.removeAllFeaturesFromLayer({ layerName: BORDERS_LAYER_NAME }); } catch (_) {}
-    try { sdk.Map.addFeaturesToLayer({ layerName: BORDERS_LAYER_NAME, features: bordersFeatures }); } catch (_) {}
+    for (const [id] of borderDefs) {
+      if (!isBorderVisible(id)) continue;
+      const features = borderFeatures.get(id);
+      if (features) {
+        try { sdk.Map.addFeaturesToLayer({ layerName: BORDERS_LAYER_NAME, features }); } catch (_) {}
+      } else {
+        fetchAndRenderBorderLayer(id);
+      }
+    }
   }
 
   // ── Status update with API + rollback ─────────────────────────────────
@@ -765,6 +817,48 @@
     selectedTileId = null;
   }
 
+  function _rebuildBorderRows() {
+    if (!_configTabPane) return;
+    const container = _configTabPane.querySelector(`#${SCRIPT_ID}__borderLayers`);
+    if (!container) return;
+    container.innerHTML = '';
+    for (const [id, def] of borderDefs) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:6px';
+
+      const chk = document.createElement('input');
+      chk.type = 'checkbox';
+      chk.checked = isBorderVisible(id);
+      chk.style.cssText = 'cursor:pointer;flex-shrink:0';
+      chk.addEventListener('change', () => {
+        userSettings.borderLayers[id] = { ...(userSettings.borderLayers[id] ?? {}), visible: chk.checked };
+        saveSettings();
+        refreshBordersLayer();
+      });
+
+      const lbl = document.createElement('label');
+      lbl.style.cssText = 'flex:1;font-size:13px;display:flex;align-items:center;gap:6px;cursor:pointer';
+      lbl.appendChild(chk);
+      const span = document.createElement('span');
+      span.textContent = def.name;
+      lbl.appendChild(span);
+
+      const colorPicker = document.createElement('input');
+      colorPicker.type = 'color';
+      colorPicker.value = getBorderColor(id);
+      colorPicker.style.cssText = 'width:40px;height:28px;border:none;cursor:pointer;border-radius:3px;padding:0';
+      colorPicker.addEventListener('input', () => {
+        userSettings.borderLayers[id] = { ...(userSettings.borderLayers[id] ?? {}), color: colorPicker.value };
+        saveSettings();
+        refreshBordersLayer();
+      });
+
+      row.appendChild(lbl);
+      row.appendChild(colorPicker);
+      container.appendChild(row);
+    }
+  }
+
   // ── Config sidebar tab ─────────────────────────────────────────────────
   async function buildConfigTab(configList) {
     const { tabLabel, tabPane } = await sdk.Sidebar.registerScriptTab();
@@ -794,22 +888,13 @@
           Resetuj kolory
         </button>
         <hr style="margin:10px 0;border:none;border-top:1px solid #ddd">
-        <div style="margin-bottom:8px;font-weight:bold">Granice województw:</div>
-        <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:6px;cursor:pointer">
-          <input type="checkbox" id="${SCRIPT_ID}__bordersVisible"
-                 ${userSettings.borders?.visible !== false ? 'checked' : ''}>
-          Wyświetl granice
-        </label>
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-          <label style="flex:1;font-size:13px">Kolor granic</label>
-          <input type="color" id="${SCRIPT_ID}__bordersColor"
-                 value="${userSettings.borders?.color ?? '#0000ff'}"
-                 style="width:40px;height:28px;border:none;cursor:pointer;border-radius:3px;padding:0">
-        </div>
+        <div style="margin-bottom:8px;font-weight:bold">Granice:</div>
+        <div id="${SCRIPT_ID}__borderLayers"></div>
       </div>`;
 
-    // Fill status color rows now (STATUS_MAP already populated from fetchConfig)
+    // Fill dynamic rows now (STATUS_MAP + borderDefs already populated from fetchConfig)
     _rebuildStatusColorRows();
+    _rebuildBorderRows();
 
     // ── Config select ──────────────────────────────────────────────────────
     const elSelect = tabPane.querySelector(`#${SCRIPT_ID}__configSelect`);
@@ -843,30 +928,16 @@
 
     tabPane.querySelector(`#${SCRIPT_ID}__resetColors`).addEventListener('click', () => {
       userSettings.statusColors = {};
+      userSettings.borderLayers = {};
       userSettings.colors.grid = DEFAULT_SETTINGS.colors.grid;
       applyServerConfig(_serverConfig);
       saveSettings();
       _rebuildStatusColorRows();
+      _rebuildBorderRows();
       rebuildStatusPanelButtons();
       updateButtonColors();
+      refreshBordersLayer();
       scheduleRender();
-    });
-
-    // ── Borders controls ───────────────────────────────────────────────────
-    tabPane.querySelector(`#${SCRIPT_ID}__bordersVisible`).addEventListener('change', (e) => {
-      userSettings.borders = { ...userSettings.borders, visible: e.target.checked };
-      saveSettings();
-      if (e.target.checked) {
-        fetchAndRenderBorders();
-      } else {
-        try { sdk.Map.removeAllFeaturesFromLayer({ layerName: BORDERS_LAYER_NAME }); } catch (_) {}
-      }
-    });
-
-    tabPane.querySelector(`#${SCRIPT_ID}__bordersColor`).addEventListener('input', (e) => {
-      userSettings.borders = { ...userSettings.borders, color: e.target.value };
-      saveSettings();
-      refreshBordersStyle();
     });
   }
 
@@ -971,6 +1042,7 @@
       buildConfigTab(configList); // no await – doesn't block map init
       registerEvents();
       await fetchTiles();
+      lastSyncTime = Date.now();
       renderVisibleTiles();
       startSync();
       log(`Ready. ${CONFIG.gridRows}×${CONFIG.gridCols} tiles, ${CONFIG.tileSizeKm} km each.`);
