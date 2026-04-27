@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                WME MapRaid PL Traffic Lights
 // @name:pl             WME MapRaid PL Sygnalizacja
-// @version             0.5.7
+// @version             0.6.0
 // @tag                 WME
 // @description         MapRaid coordination grid – mark traffic-light work tiles on the map.
 // @description:pl      Siatka koordynacyjna MapRaid – oznaczanie kafelków sygnalizacji świetlnej.
@@ -24,7 +24,7 @@
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   const SCRIPT_ID      = 'WME_MR_PL_TrafficLights';
-  const SCRIPT_VERSION = '0.5.7';
+  const SCRIPT_VERSION = '0.6.0';
   const SCRIPT_NAME = 'MapRaid TL';
   const START_GUARD = '__WME_MAPRAID_TL_BOOTSTRAPPED__';
   const LAYER_NAME         = 'tl.grid';
@@ -49,7 +49,7 @@
 
   const DEBUG = false;
   const log   = (...args) => console.log(`[${SCRIPT_NAME}]`, ...args);
-  const dbg   = (...args) => { if (DEBUG) console.log(`[${SCRIPT_NAME}:dbg]`, ...args); };
+  const dbg   = DEBUG ? (...args) => console.log(`[${SCRIPT_NAME}:dbg]`, ...args) : () => {};
 
   // ── State ──────────────────────────────────────────────────────────────
   // null = not yet evaluated (no row in DB)
@@ -105,6 +105,10 @@
   let panel          = null;
   let renderTimer    = null;
   let altPressed     = false;
+  let panelUserLabel  = null;
+  let panelBtnRow     = null;
+  let _configTabPane  = null;
+  const statusButtonEls = [];
 
   // ── Config helpers ─────────────────────────────────────────────────────
   function resolveConfigId(list) {
@@ -162,13 +166,6 @@
     });
   }
 
-  function extractEtag(responseHeaders) {
-    const match = responseHeaders?.match(/etag:\s*(W\/"[^"]*"|"[^"]*")/i)?.[1] ?? null;
-    dbg('extractEtag raw headers:', responseHeaders);
-    dbg('extractEtag result:', match);
-    return match;
-  }
-
   // Shared GET with ETag support. Returns { status, data, etag } or throws.
   async function fetchWithEtag(label, url, currentEtag) {
     const headers = { Accept: 'application/json' };
@@ -176,7 +173,7 @@
     dbg(`${label} → GET ${url}`, headers);
 
     const res = await apiFetch(url, { headers });
-    const etag = extractEtag(res.responseHeaders);
+    const etag = res.responseHeaders?.match(/etag:\s*(W\/"[^"]*"|"[^"]*")/i)?.[1] ?? null;
     dbg(`${label} ← status:`, res.status, '| ETag:', etag);
 
     return { status: res.status, data: res.response, etag };
@@ -188,26 +185,39 @@
     return res.response; // array of { id, country, name, ... }
   }
 
+  let _switchConfigLock = false;
+
   async function switchConfig(configId) {
     if (userSettings.configId === configId) return;
-    userSettings.configId = configId;
-    saveSettings();
-    configEtag = null;
-    tilesEtag  = null;
-    CONFIG     = null;
-    tileStatuses.clear();
-    tileUpdatedBy.clear();
-    tileValidatedBy.clear();
-    try { sdk.Map.removeAllFeaturesFromLayer({ layerName: LAYER_NAME }); } catch (_) {}
-    clearTimeout(syncTimeout);
-    syncTimeout = null;
-    await fetchConfig();
-    _rebuildStatusColorRows();
-    rebuildStatusPanelButtons();
-    const changed = await fetchTiles();
-    if (changed) renderVisibleTiles();
-    scheduleSync();
-    log(`Switched to config ${configId}.`);
+    if (_switchConfigLock) return;
+    _switchConfigLock = true;
+    try {
+      hideStatusPanel();
+      userSettings.configId = configId;
+      saveSettings();
+      configEtag = null;
+      tilesEtag  = null;
+      CONFIG     = null;
+      tileStatuses.clear();
+      tileUpdatedBy.clear();
+      tileValidatedBy.clear();
+      try { sdk.Map.removeAllFeaturesFromLayer({ layerName: LAYER_NAME }); } catch (_) {}
+      clearTimeout(syncTimeout);
+      syncTimeout = null;
+      await fetchConfig();
+      // Clear borders cache — bordersUrl may have changed in the new config.
+      bordersFeatures = null;
+      try { sdk.Map.removeAllFeaturesFromLayer({ layerName: BORDERS_LAYER_NAME }); } catch (_) {}
+      if (userSettings.borders?.visible !== false) fetchAndRenderBorders();
+      _rebuildStatusColorRows();
+      rebuildStatusPanelButtons();
+      const changed = await fetchTiles();
+      if (changed) renderVisibleTiles();
+      scheduleSync();
+      log(`Switched to config ${configId}.`);
+    } finally {
+      _switchConfigLock = false;
+    }
   }
 
   async function fetchConfig() {
@@ -297,16 +307,6 @@
     return ids;
   }
 
-  // ── Viewport bounds via SDK ────────────────────────────────────────────
-  function getViewportBounds() {
-    try {
-      const [west, south, east, north] = sdk.Map.getMapExtent();
-      return { south, west, north, east };
-    } catch (_) {
-      return null;
-    }
-  }
-
   // ── Zoom fade ──────────────────────────────────────────────────────────
   // zoom ≤ 15 → factor 1.0  (full opacity)
   // zoom 16-20 → linear fade from 1.0 down to 0.05  (95% transparent)
@@ -361,8 +361,9 @@
 
     const colorsOnly = zoom < CONFIG.renderZoomMin;
 
-    const bounds = getViewportBounds();
-    if (!bounds) return;
+    let bounds;
+    try { const [west, south, east, north] = sdk.Map.getMapExtent(); bounds = { south, west, north, east }; }
+    catch (_) { return; }
 
     let features;
     if (colorsOnly) {
@@ -402,7 +403,8 @@
   }
 
   // ── Borders layer ──────────────────────────────────────────────────────
-  let bordersFeatures = null; // cached LineString features after first fetch
+  let bordersFeatures  = null; // cached LineString features after first fetch
+  let _bordersFetching = false; // prevents concurrent HTTP requests for borders
 
   // Convert Polygon/MultiPolygon features to LineString features (one per ring).
   // SDK requires uniform geometry type; LineString is correct for border lines.
@@ -456,6 +458,8 @@
       try { sdk.Map.addFeaturesToLayer({ layerName: BORDERS_LAYER_NAME, features: bordersFeatures }); } catch (_) {}
       return;
     }
+    if (_bordersFetching) return;
+    _bordersFetching = true;
     try {
       const res = await apiFetch(BORDERS_URL);
       if (res.status !== 200) { log('Borders GeoJSON fetch failed:', res.status); return; }
@@ -466,6 +470,8 @@
       log(`Borders loaded: ${bordersFeatures.length} features`);
     } catch (e) {
       log('Borders fetch error:', e);
+    } finally {
+      _bordersFetching = false;
     }
   }
 
@@ -476,6 +482,7 @@
   }
 
   // ── Status update with API + rollback ─────────────────────────────────
+  const _pendingTiles = new Set(); // prevents concurrent updates on the same tile
   // updatedBy: string → set, null → delete, undefined → leave unchanged
   function applyTileStatus(tileId, status, updatedBy = undefined) {
     if (status === null) {
@@ -504,6 +511,9 @@
   }
 
   async function updateTileStatus(tileId, newStatus) {
+    if (_pendingTiles.has(tileId)) return;
+    _pendingTiles.add(tileId);
+
     const prevStatus    = tileStatuses.get(tileId) ?? null;
     const prevUpdatedBy = tileUpdatedBy.get(tileId) ?? null;
     const user          = sdk.State.getUserInfo()?.userName ?? '';
@@ -533,6 +543,8 @@
     } catch (e) {
       log('Status update failed, rolling back:', e);
       applyTileStatus(tileId, prevStatus, prevUpdatedBy); // rollback; null → delete author
+    } finally {
+      _pendingTiles.delete(tileId);
     }
   }
 
@@ -619,19 +631,35 @@
     if (!_configTabPane) return;
     const container = _configTabPane.querySelector(`#${SCRIPT_ID}__statusColors`);
     if (!container) return;
-    container.innerHTML = [...STATUS_MAP.values()].map((s) => `
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-        <label style="flex:1;font-size:13px">${s.label}</label>
-        <input type="color" data-status-id="${s.id}" value="${s.color}"
-               style="width:40px;height:28px;border:none;cursor:pointer;border-radius:3px;padding:0">
-      </div>`).join('');
+    container.innerHTML = '';
+    for (const s of STATUS_MAP.values()) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:6px';
+      const label = document.createElement('label');
+      label.style.cssText = 'flex:1;font-size:13px';
+      label.textContent = s.label;
+      const input = document.createElement('input');
+      input.type = 'color';
+      input.dataset.statusId = String(s.id);
+      input.value = s.color;
+      input.style.cssText = 'width:40px;height:28px;border:none;cursor:pointer;border-radius:3px;padding:0';
+      row.appendChild(label);
+      row.appendChild(input);
+      container.appendChild(row);
+    }
     _attachStatusColorListeners(container);
   }
 
   function _populateStatusButtons(container) {
     statusButtonEls.length = 0;
     const _ur = sdk.State.getUserInfo()?.rank ?? 0;
-    buildStatusButtons(_ur).forEach(({ label, status, bg, fg }) => {
+    const defs = [];
+    for (const [id, s] of STATUS_MAP) {
+      if (!s.ro && (_ur ?? 0) >= (s._g ?? 0))
+        defs.push({ label: s.label, status: id, bg: s.color, fg: '#ffffff' });
+    }
+    defs.push({ label: '✕ Wyczyść', status: null, bg: '#dddddd', fg: '#333333' });
+    for (const { label, status, bg, fg } of defs) {
       const btn = document.createElement('button');
       btn.textContent = label;
       btn.style.cssText = [
@@ -652,7 +680,7 @@
       });
       container.appendChild(btn);
       statusButtonEls.push(btn);
-    });
+    }
   }
 
   function rebuildStatusPanelButtons() {
@@ -660,22 +688,6 @@
     panelBtnRow.innerHTML = '';
     _populateStatusButtons(panelBtnRow);
   }
-
-  function buildStatusButtons(_ur) {
-    const buttons = [];
-    for (const [id, s] of STATUS_MAP) {
-      if (s.ro) continue;
-      if ((_ur ?? 0) < (s._g ?? 0)) continue;
-      buttons.push({ label: s.label, status: id, bg: s.color, fg: '#ffffff' });
-    }
-    buttons.push({ label: '✕ Wyczyść', status: null, bg: '#dddddd', fg: '#333333' });
-    return buttons;
-  }
-
-  let panelUserLabel  = null;
-  let panelBtnRow     = null;
-  let _configTabPane  = null;
-  const statusButtonEls = [];
 
   function updateButtonColors() {
     statusButtonEls.forEach((btn) => {
@@ -768,9 +780,6 @@
         <div style="margin-bottom:4px;font-weight:bold">Konfiguracja:</div>
         <select id="${SCRIPT_ID}__configSelect"
                 style="width:100%;padding:4px;font-size:12px;margin-bottom:10px;border-radius:3px;border:1px solid #ccc">
-          ${(configList ?? []).map((c) =>
-            `<option value="${c.id}"${c.id === userSettings.configId ? ' selected' : ''}>${c.country} – ${c.name}</option>`
-          ).join('') || `<option value="${userSettings.configId}">Config #${userSettings.configId}</option>`}
         </select>
         <hr style="margin:8px 0;border:none;border-top:1px solid #ddd">
         <div style="margin-bottom:8px;font-weight:bold">Kolory:</div>
@@ -804,6 +813,20 @@
 
     // ── Config select ──────────────────────────────────────────────────────
     const elSelect = tabPane.querySelector(`#${SCRIPT_ID}__configSelect`);
+    if (configList?.length) {
+      for (const c of configList) {
+        const opt = document.createElement('option');
+        opt.value = String(c.id);
+        opt.textContent = `${c.country} – ${c.name}`;
+        opt.selected = c.id === userSettings.configId;
+        elSelect.appendChild(opt);
+      }
+    } else {
+      const opt = document.createElement('option');
+      opt.value = String(userSettings.configId);
+      opt.textContent = `Config #${userSettings.configId}`;
+      elSelect.appendChild(opt);
+    }
     elSelect.addEventListener('change', () => {
       const id = Number(elSelect.value);
       if (id && id !== userSettings.configId) switchConfig(id);
@@ -847,7 +870,6 @@
     });
   }
 
-  // ── Click detection ────────────────────────────────────────────────────
   // ── Neighbor status (alt+click) ────────────────────────────────────────
   function getNeighborStatus(tileId) {
     const [row, col] = tileId.split('_').map(Number);
@@ -860,7 +882,7 @@
       .map((id) => tileStatuses.get(id))
       .filter((s) => s !== undefined && !STATUS_MAP.get(s)?.ro && s !== 1);
     if (statuses.length === 0) return null;
-    return Math.min(...statuses); // lowest value wins: 3 > 4 > 5 > 6
+    return Math.min(...statuses); // 3 < 4 < 5 < 6 numerically — Math.min picks the most urgent
   }
 
   function handleMapClick(event) {
