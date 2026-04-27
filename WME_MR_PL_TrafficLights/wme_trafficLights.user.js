@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                WME MapRaid PL Traffic Lights
 // @name:pl             WME MapRaid PL Sygnalizacja
-// @version             0.5.6
+// @version             0.5.7
 // @tag                 WME
 // @description         MapRaid coordination grid – mark traffic-light work tiles on the map.
 // @description:pl      Siatka koordynacyjna MapRaid – oznaczanie kafelków sygnalizacji świetlnej.
@@ -24,12 +24,12 @@
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   const SCRIPT_ID      = 'WME_MR_PL_TrafficLights';
-  const SCRIPT_VERSION = '0.5.6';
+  const SCRIPT_VERSION = '0.5.7';
   const SCRIPT_NAME = 'MapRaid TL';
   const START_GUARD = '__WME_MAPRAID_TL_BOOTSTRAPPED__';
   const LAYER_NAME         = 'tl.grid';
   const BORDERS_LAYER_NAME = 'tl.borders';
-  const BORDERS_GEOJSON_URL = 'https://raw.githubusercontent.com/ppatrzyk/polska-geojson/refs/heads/master/wojewodztwa/wojewodztwa-medium.geojson';
+  let BORDERS_URL = 'https://raw.githubusercontent.com/ppatrzyk/polska-geojson/refs/heads/master/wojewodztwa/wojewodztwa-medium.geojson';
 
   // ── API ────────────────────────────────────────────────────────────────
   const API_BASE      = 'https://mqtt2api.labtool.pl/mapraid';
@@ -53,32 +53,17 @@
 
   // ── State ──────────────────────────────────────────────────────────────
   // null = not yet evaluated (no row in DB)
-  // 1    = out_of_mr   – outside MapRaid area (system-set, read-only for users)
-  // 2    = reserved
-  // 3    = empty       – tile reviewed, no roads requiring lights
-  // 4    = in_progress – work started
-  // 5    = done        – fully mapped
-  // 6    = wsparcie    – participant needs expert help (mentor)
-  // 9    = verified    – reviewed and confirmed by elevated user
-  const STATUS = Object.freeze({ OUT_OF_MR: 1, EMPTY: 3, IN_PROGRESS: 4, DONE: 5, WSPARCIE: 6, VERIFIED: 9 });
+  // Status definitions are loaded dynamically from server config.
+  // id → { id, label, color, ro (bool), _g (int, access threshold), _vb (bool) }
+  let STATUS_MAP = new Map();
 
   // ── Settings / LocalStorage ────────────────────────────────────────────────
   const SETTINGS_KEY = SCRIPT_ID;
   const DEFAULT_SETTINGS = {
-    configId: 1,
-    borders: {
-      visible: true,
-      color:   '#0000ff',
-    },
-    colors: {
-      grid:       '#ff0000',
-      outOfMr:    '#555555',
-      empty:      '#3498db',
-      inProgress: '#f5c400',
-      done:       '#00a650',
-      wsparcie:   '#ff3939',
-      verified:   '#9b59b6',
-    },
+    configId:     null,
+    borders:      { visible: true, color: '#0000ff' },
+    colors:       { grid: '#ff0000' },
+    statusColors: {},   // id (int) → hex override of server-defined color
   };
 
   function loadSettings() {
@@ -89,8 +74,9 @@
       return {
         ...DEFAULT_SETTINGS,
         ...parsed,
-        borders: { ...DEFAULT_SETTINGS.borders, ...(parsed?.borders ?? {}) },
-        colors:  { ...DEFAULT_SETTINGS.colors,  ...(parsed?.colors  ?? {}) },
+        borders:      { ...DEFAULT_SETTINGS.borders, ...(parsed?.borders ?? {}) },
+        colors:       { ...DEFAULT_SETTINGS.colors,  ...(parsed?.colors  ?? {}) },
+        statusColors: { ...(parsed?.statusColors ?? {}) },
       };
     } catch (_) {
       return structuredClone(DEFAULT_SETTINGS);
@@ -104,9 +90,9 @@
   }
 
   let userSettings = loadSettings();
-  const _t = Object.keys(UI_CONFIG).length;
 
   let CONFIG              = null; // set after fetchConfig()
+  let _serverConfig       = null; // raw config JSON from server, for color reset
   const tileStatuses      = new Map(); // tileId → 1 | 3 | 4 | 5 | 6 | 9
   const tileUpdatedBy     = new Map(); // tileId → string
   const tileValidatedBy   = new Map(); // tileId → string (only for VERIFIED tiles)
@@ -119,6 +105,27 @@
   let panel          = null;
   let renderTimer    = null;
   let altPressed     = false;
+
+  // ── Config helpers ─────────────────────────────────────────────────────
+  function resolveConfigId(list) {
+    if (!list?.length) return 1;
+    const ids = list.map((c) => c.id);
+    if (userSettings.configId && ids.includes(userSettings.configId)) return userSettings.configId;
+    return Math.min(...ids);
+  }
+
+  function applyServerConfig(cfg) {
+    STATUS_MAP.clear(); // always clear — stale entries must not survive config switch
+    if (!cfg?.statuses) return;
+    for (const s of cfg.statuses) {
+      STATUS_MAP.set(s.id, {
+        ...s,
+        color: userSettings.statusColors[s.id] ?? s.color,
+      });
+    }
+    if (cfg.bordersUrl) BORDERS_URL = cfg.bordersUrl;
+    if (cfg.gridColor)  userSettings.colors.grid = cfg.gridColor;
+  }
 
   // ── Grid config builder ────────────────────────────────────────────────
   function buildConfig(apiData) {
@@ -195,6 +202,8 @@
     clearTimeout(syncTimeout);
     syncTimeout = null;
     await fetchConfig();
+    _rebuildStatusColorRows();
+    rebuildStatusPanelButtons();
     const changed = await fetchTiles();
     if (changed) renderVisibleTiles();
     scheduleSync();
@@ -212,6 +221,8 @@
       log(`⚠ Version mismatch: script=${SCRIPT_VERSION}, API=${data.version}. Consider updating.`);
     }
     CONFIG = buildConfig(data);
+    _serverConfig = data.config ?? null;
+    applyServerConfig(_serverConfig);
     log(`Config loaded: ${CONFIG.gridRows}×${CONFIG.gridCols} tiles, ${CONFIG.tileSizeKm} km each.`);
   }
 
@@ -312,52 +323,21 @@
     sdk.Map.addLayer({
       layerName: LAYER_NAME,
       styleContext: {
-        getFillColor: ({ feature }) => {
-          const c = userSettings.colors;
-          const s = feature?.properties?.status;
-          if (s === STATUS.OUT_OF_MR)   return c.outOfMr;
-          if (s === STATUS.EMPTY)       return c.empty;
-          if (s === STATUS.IN_PROGRESS) return c.inProgress;
-          if (s === STATUS.DONE)        return c.done;
-          if (s === STATUS.WSPARCIE)    return c.wsparcie;
-          if (s === STATUS.VERIFIED)    return c.verified;
-          return '#000000';
-        },
-        // fillOpacity: 0 for null tiles, 0.55 for colored tiles × zoom fade.
-        getFillOpacity: ({ feature, zoomLevel }) => {
-          const base = feature?.properties?.status !== null && feature?.properties?.status !== undefined ? 0.55 : 0;
+        getFillColor:    ({ feature }) => STATUS_MAP.get(feature?.properties?.status)?.color ?? '#888888',
+        getFillOpacity:  ({ feature, zoomLevel }) => {
+          const base = feature?.properties?.status != null ? 0.55 : 0;
           return base * zoomFade(zoomLevel);
         },
-        getStrokeColor: () => userSettings.colors.grid,
+        getStrokeColor:  () => userSettings.colors.grid,
         getStrokeOpacity: ({ zoomLevel }) => zoomLevel >= CONFIG.renderZoomMin ? 0.7 : 0,
       },
       styleRules: [
         {
           predicate: (p) => p.status === null,
-          style: { fillOpacity: '${getFillOpacity}', strokeColor: '${getStrokeColor}', strokeWidth: 1, strokeOpacity: '${getStrokeOpacity}' },
+          style: { fillOpacity: 0, strokeColor: '${getStrokeColor}', strokeWidth: 1, strokeOpacity: '${getStrokeOpacity}' },
         },
         {
-          predicate: (p) => p.status === STATUS.OUT_OF_MR,
-          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeColor: '${getStrokeColor}', strokeWidth: 1, strokeOpacity: '${getStrokeOpacity}' },
-        },
-        {
-          predicate: (p) => p.status === STATUS.EMPTY,
-          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeColor: '${getStrokeColor}', strokeWidth: 1, strokeOpacity: '${getStrokeOpacity}' },
-        },
-        {
-          predicate: (p) => p.status === STATUS.IN_PROGRESS,
-          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeColor: '${getStrokeColor}', strokeWidth: 1, strokeOpacity: '${getStrokeOpacity}' },
-        },
-        {
-          predicate: (p) => p.status === STATUS.DONE,
-          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeColor: '${getStrokeColor}', strokeWidth: 1, strokeOpacity: '${getStrokeOpacity}' },
-        },
-        {
-          predicate: (p) => p.status === STATUS.WSPARCIE,
-          style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeColor: '${getStrokeColor}', strokeWidth: 1, strokeOpacity: '${getStrokeOpacity}' },
-        },
-        {
-          predicate: (p) => p.status === STATUS.VERIFIED,
+          predicate: (p) => p.status !== null,
           style: { fillColor: '${getFillColor}', fillOpacity: '${getFillOpacity}', strokeColor: '${getStrokeColor}', strokeWidth: 1, strokeOpacity: '${getStrokeOpacity}' },
         },
       ],
@@ -477,7 +457,7 @@
       return;
     }
     try {
-      const res = await apiFetch(BORDERS_GEOJSON_URL);
+      const res = await apiFetch(BORDERS_URL);
       if (res.status !== 200) { log('Borders GeoJSON fetch failed:', res.status); return; }
       bordersFeatures = geoJsonToLineFeatures(res.response?.features ?? []);
       if (userSettings.borders?.visible !== false) {
@@ -621,57 +601,37 @@
   }
 
   // ── Status panel ───────────────────────────────────────────────────────
-  const STATUS_BUTTONS = [
-    { label: 'Brak 🚦',    status: STATUS.EMPTY,        bg: '#888888', fg: '#ffffff' },
-    { label: 'W trakcie',  status: STATUS.IN_PROGRESS,  bg: '#f5c400', fg: '#333333' },
-    { label: 'Gotowe',     status: STATUS.DONE,         bg: '#00a650', fg: '#ffffff' },
-    { label: '🆘',         status: STATUS.WSPARCIE,     bg: '#ff3939', fg: '#ffffff' },
-    { label: 'Sprawdzone', status: STATUS.VERIFIED,     bg: '#9b59b6', fg: '#ffffff', _g: true },
-    { label: '✕ Wyczyść',  status: null,                bg: '#dddddd', fg: '#333333' },
-  ];
-
-  let panelUserLabel = null;
-  let panelBtnRow    = null;
-  const statusButtonEls = [];
-
-  function updateButtonColors() {
-    const c = userSettings.colors;
-    const colorMap = {
-      [STATUS.OUT_OF_MR]:   c.outOfMr,
-      [STATUS.EMPTY]:       c.empty,
-      [STATUS.IN_PROGRESS]: c.inProgress,
-      [STATUS.DONE]:        c.done,
-      [STATUS.WSPARCIE]:    c.wsparcie,
-      [STATUS.VERIFIED]:    c.verified,
-    };
-    statusButtonEls.forEach((btn) => {
-      const s = btn.dataset.s ? Number(btn.dataset.s) : null;
-      if (s !== null && colorMap[s]) btn.style.background = colorMap[s];
+  function _attachStatusColorListeners(container) {
+    container.querySelectorAll('input[data-status-id]').forEach((input) => {
+      input.addEventListener('input', () => {
+        const id = Number(input.dataset.statusId);
+        userSettings.statusColors[id] = input.value;
+        const entry = STATUS_MAP.get(id);
+        if (entry) entry.color = input.value;
+        saveSettings();
+        updateButtonColors();
+        scheduleRender();
+      });
     });
   }
 
-  function createStatusPanel() {
-    const _ur = sdk.State.getUserInfo()?.rank ?? 0;
-    panel = document.createElement('div');
-    panel.id = 'tl-status-panel';
-    panel.style.cssText = [
-      'position:absolute',
-      'background:#fff',
-      'border:1px solid #888',
-      'border-radius:6px',
-      'padding:6px 8px',
-      'z-index:9000',
-      'display:none',
-      'box-shadow:2px 2px 8px rgba(0,0,0,.35)',
-      'font:13px/1.4 sans-serif',
-      'white-space:nowrap',
-      'pointer-events:auto',
-    ].join(';');
+  function _rebuildStatusColorRows() {
+    if (!_configTabPane) return;
+    const container = _configTabPane.querySelector(`#${SCRIPT_ID}__statusColors`);
+    if (!container) return;
+    container.innerHTML = [...STATUS_MAP.values()].map((s) => `
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <label style="flex:1;font-size:13px">${s.label}</label>
+        <input type="color" data-status-id="${s.id}" value="${s.color}"
+               style="width:40px;height:28px;border:none;cursor:pointer;border-radius:3px;padding:0">
+      </div>`).join('');
+    _attachStatusColorListeners(container);
+  }
 
-    panelBtnRow = document.createElement('div');
-    const btnRow = panelBtnRow;
-    STATUS_BUTTONS.forEach(({ label, status, bg, fg, _g }) => {
-      if (_g && _ur < _t) return;
+  function _populateStatusButtons(container) {
+    statusButtonEls.length = 0;
+    const _ur = sdk.State.getUserInfo()?.rank ?? 0;
+    buildStatusButtons(_ur).forEach(({ label, status, bg, fg }) => {
       const btn = document.createElement('button');
       btn.textContent = label;
       btn.style.cssText = [
@@ -690,10 +650,61 @@
         if (selectedTileId) updateTileStatus(selectedTileId, status);
         hideStatusPanel();
       });
-      btnRow.appendChild(btn);
+      container.appendChild(btn);
       statusButtonEls.push(btn);
     });
-    panel.appendChild(btnRow);
+  }
+
+  function rebuildStatusPanelButtons() {
+    if (!panelBtnRow) return;
+    panelBtnRow.innerHTML = '';
+    _populateStatusButtons(panelBtnRow);
+  }
+
+  function buildStatusButtons(_ur) {
+    const buttons = [];
+    for (const [id, s] of STATUS_MAP) {
+      if (s.ro) continue;
+      if ((_ur ?? 0) < (s._g ?? 0)) continue;
+      buttons.push({ label: s.label, status: id, bg: s.color, fg: '#ffffff' });
+    }
+    buttons.push({ label: '✕ Wyczyść', status: null, bg: '#dddddd', fg: '#333333' });
+    return buttons;
+  }
+
+  let panelUserLabel  = null;
+  let panelBtnRow     = null;
+  let _configTabPane  = null;
+  const statusButtonEls = [];
+
+  function updateButtonColors() {
+    statusButtonEls.forEach((btn) => {
+      const s = btn.dataset.s ? Number(btn.dataset.s) : null;
+      const color = s !== null ? STATUS_MAP.get(s)?.color : null;
+      if (color) btn.style.background = color;
+    });
+  }
+
+  function createStatusPanel() {
+    panel = document.createElement('div');
+    panel.id = 'tl-status-panel';
+    panel.style.cssText = [
+      'position:absolute',
+      'background:#fff',
+      'border:1px solid #888',
+      'border-radius:6px',
+      'padding:6px 8px',
+      'z-index:9000',
+      'display:none',
+      'box-shadow:2px 2px 8px rgba(0,0,0,.35)',
+      'font:13px/1.4 sans-serif',
+      'white-space:nowrap',
+      'pointer-events:auto',
+    ].join(';');
+
+    panelBtnRow = document.createElement('div');
+    _populateStatusButtons(panelBtnRow);
+    panel.appendChild(panelBtnRow);
 
     panelUserLabel = document.createElement('div');
     panelUserLabel.style.cssText = 'margin-top:5px;font-size:11px;color:#666;text-align:center';
@@ -712,8 +723,8 @@
     selectedTileId = tileId;
 
     const _ur = sdk.State.getUserInfo()?.rank ?? 0;
-    const _iv = tileStatuses.get(tileId) === STATUS.VERIFIED;
-    const _ro = _iv && _ur < _t;
+    const _sd = STATUS_MAP.get(tileStatuses.get(tileId));
+    const _ro = _sd?.ro || (_ur < (_sd?._g ?? 0));
 
     panelBtnRow.style.display = _ro ? 'none' : '';
 
@@ -743,25 +754,11 @@
   }
 
   // ── Config sidebar tab ─────────────────────────────────────────────────
-  async function buildConfigTab() {
+  async function buildConfigTab(configList) {
     const { tabLabel, tabPane } = await sdk.Sidebar.registerScriptTab();
     tabLabel.textContent = 'MapRaid';
     tabLabel.title = SCRIPT_NAME;
-
-    const colorRows = [
-      { key: 'grid',       label: 'Siatka' },
-      { key: 'outOfMr',   label: 'Poza MR' },
-      { key: 'empty',      label: 'Brak 🚦' },
-      { key: 'inProgress', label: 'W trakcie' },
-      { key: 'done',       label: 'Gotowe' },
-      { key: 'wsparcie',   label: 'Wsparcie 🆘' },
-      { key: 'verified',   label: 'Sprawdzone' },
-    ].map(({ key, label }) => `
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-        <label style="flex:1;font-size:13px">${label}</label>
-        <input type="color" data-color-key="${key}" value="${userSettings.colors[key]}"
-               style="width:40px;height:28px;border:none;cursor:pointer;border-radius:3px;padding:0">
-      </div>`).join('');
+    _configTabPane = tabPane;
 
     tabPane.innerHTML = `
       <div style="padding:10px;font:13px/1.5 sans-serif">
@@ -771,11 +768,18 @@
         <div style="margin-bottom:4px;font-weight:bold">Konfiguracja:</div>
         <select id="${SCRIPT_ID}__configSelect"
                 style="width:100%;padding:4px;font-size:12px;margin-bottom:10px;border-radius:3px;border:1px solid #ccc">
-          <option value="">Ładowanie…</option>
+          ${(configList ?? []).map((c) =>
+            `<option value="${c.id}"${c.id === userSettings.configId ? ' selected' : ''}>${c.country} – ${c.name}</option>`
+          ).join('') || `<option value="${userSettings.configId}">Config #${userSettings.configId}</option>`}
         </select>
         <hr style="margin:8px 0;border:none;border-top:1px solid #ddd">
-        <div style="margin-bottom:8px;font-weight:bold">Kolory statusów:</div>
-        ${colorRows}
+        <div style="margin-bottom:8px;font-weight:bold">Kolory:</div>
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <label style="flex:1;font-size:13px">Siatka</label>
+          <input type="color" data-color-key="grid" value="${userSettings.colors.grid}"
+                 style="width:40px;height:28px;border:none;cursor:pointer;border-radius:3px;padding:0">
+        </div>
+        <div id="${SCRIPT_ID}__statusColors"></div>
         <button id="${SCRIPT_ID}__resetColors"
                 style="margin-top:4px;padding:4px 10px;font-size:12px;cursor:pointer;border-radius:3px">
           Resetuj kolory
@@ -795,38 +799,32 @@
         </div>
       </div>`;
 
+    // Fill status color rows now (STATUS_MAP already populated from fetchConfig)
+    _rebuildStatusColorRows();
+
     // ── Config select ──────────────────────────────────────────────────────
     const elSelect = tabPane.querySelector(`#${SCRIPT_ID}__configSelect`);
-    fetchConfigList().then((list) => {
-      elSelect.innerHTML = list.map((c) =>
-        `<option value="${c.id}"${c.id === userSettings.configId ? ' selected' : ''}>${c.country} – ${c.name}</option>`
-      ).join('');
-    }).catch((e) => {
-      log('Config list fetch failed:', e);
-      elSelect.innerHTML = `<option value="${userSettings.configId}">Config #${userSettings.configId}</option>`;
-    });
-
     elSelect.addEventListener('change', () => {
       const id = Number(elSelect.value);
       if (id && id !== userSettings.configId) switchConfig(id);
     });
 
-    // ── Color pickers ──────────────────────────────────────────────────────
+    // ── Grid color picker ──────────────────────────────────────────────────
     tabPane.querySelectorAll('input[data-color-key]').forEach((input) => {
       input.addEventListener('input', () => {
         userSettings.colors[input.dataset.colorKey] = input.value;
         saveSettings();
-        updateButtonColors();
         scheduleRender();
       });
     });
 
     tabPane.querySelector(`#${SCRIPT_ID}__resetColors`).addEventListener('click', () => {
-      userSettings.colors = { ...DEFAULT_SETTINGS.colors };
+      userSettings.statusColors = {};
+      userSettings.colors.grid = DEFAULT_SETTINGS.colors.grid;
+      applyServerConfig(_serverConfig);
       saveSettings();
-      tabPane.querySelectorAll('input[data-color-key]').forEach((inp) => {
-        inp.value = userSettings.colors[inp.dataset.colorKey];
-      });
+      _rebuildStatusColorRows();
+      rebuildStatusPanelButtons();
       updateButtonColors();
       scheduleRender();
     });
@@ -860,7 +858,7 @@
     ];
     const statuses = neighbors
       .map((id) => tileStatuses.get(id))
-      .filter((s) => s !== undefined && s !== STATUS.OUT_OF_MR);
+      .filter((s) => s !== undefined && !STATUS_MAP.get(s)?.ro && s !== 1);
     if (statuses.length === 0) return null;
     return Math.min(...statuses); // lowest value wins: 3 > 4 > 5 > 6
   }
@@ -875,8 +873,9 @@
     const tileId = latLonToTileId(event.lat, event.lon);
     if (!tileId) { hideStatusPanel(); return; }
 
-    // OUT_OF_MR tiles are system-set and cannot be changed by users.
-    if (tileStatuses.get(tileId) === STATUS.OUT_OF_MR) { hideStatusPanel(); return; }
+    // Tiles with ro=true are system-set and cannot be changed by users.
+    const _ts = tileStatuses.get(tileId);
+    if (STATUS_MAP.get(_ts)?.ro || _ts === 1) { hideStatusPanel(); return; }
 
     if (altPressed) {
       const status = getNeighborStatus(tileId);
@@ -930,12 +929,24 @@
   // ── Bootstrap ──────────────────────────────────────────────────────────
   async function initScript() {
     try {
+      let configList;
+      try {
+        configList = await fetchConfigList();
+        const resolved = resolveConfigId(configList);
+        if (resolved !== userSettings.configId) {
+          userSettings.configId = resolved;
+          saveSettings();
+        }
+      } catch (e) {
+        log('Config list fetch failed (non-fatal):', e);
+        configList = null;
+      }
       await fetchConfig();
       initLayer();
       initBordersLayer();
       createStatusPanel();
       updateButtonColors();
-      buildConfigTab(); // no await – doesn't block map init
+      buildConfigTab(configList); // no await – doesn't block map init
       registerEvents();
       await fetchTiles();
       renderVisibleTiles();
