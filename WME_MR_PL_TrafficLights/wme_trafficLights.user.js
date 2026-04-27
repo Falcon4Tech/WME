@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                WME MapRaid PL Traffic Lights
 // @name:pl             WME MapRaid PL Sygnalizacja
-// @version             0.6.1
+// @version             0.6.3
 // @tag                 WME
 // @description         MapRaid coordination grid – mark traffic-light work tiles on the map.
 // @description:pl      Siatka koordynacyjna MapRaid – oznaczanie kafelków sygnalizacji świetlnej.
@@ -24,7 +24,7 @@
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   const SCRIPT_ID      = 'WME_MR_PL_TrafficLights';
-  const SCRIPT_VERSION = '0.6.1';
+  const SCRIPT_VERSION = '0.6.3';
   const SCRIPT_NAME = 'MapRaid TL';
   const START_GUARD = '__WME_MAPRAID_TL_BOOTSTRAPPED__';
   const LAYER_NAME         = 'tl.grid';
@@ -140,6 +140,69 @@
   let panelBtnRow     = null;
   let _configTabPane  = null;
   const statusButtonEls = [];
+  const runtimeListeners = new Set();
+
+  function cloneJson(value) {
+    return value == null ? value : JSON.parse(JSON.stringify(value));
+  }
+
+  function getTileStatusCounts() {
+    const counts = {};
+    for (const status of tileStatuses.values()) {
+      counts[status] = (counts[status] ?? 0) + 1;
+    }
+    return counts;
+  }
+
+  function emitRuntimeChange(reason) {
+    const detail = { reason, api: UW.WME_MR_PL_TrafficLights_API };
+    try {
+      window.dispatchEvent(new CustomEvent('WME_MR_PL_TrafficLights:change', { detail }));
+    } catch (_) {}
+    for (const fn of runtimeListeners) {
+      try { fn(detail); } catch (e) { log('Runtime listener error:', e); }
+    }
+  }
+
+  async function refreshRuntimeConfig() {
+    configEtag = null;
+    await fetchConfig();
+    borderFeatures.clear();
+    borderFetching.clear();
+    try { sdk.Map.removeAllFeaturesFromLayer({ layerName: BORDERS_LAYER_NAME }); } catch (_) {}
+    for (const [id] of borderDefs) {
+      if (isBorderVisible(id)) fetchAndRenderBorderLayer(id);
+    }
+    _rebuildStatusColorRows();
+    _rebuildBorderRows();
+    rebuildStatusPanelButtons();
+    updateButtonColors();
+    scheduleRender();
+    emitRuntimeChange('config-refresh');
+  }
+
+  function publishRuntimeApi() {
+    UW.WME_MR_PL_TrafficLights_API = {
+      scriptId: SCRIPT_ID,
+      scriptVersion: SCRIPT_VERSION,
+      apiBase: API_BASE,
+      apiFetch,
+      get sdk() { return sdk; },
+      get configId() { return userSettings.configId; },
+      get tabPane() { return _configTabPane; },
+      get rawConfig() { return cloneJson(_serverConfig); },
+      get statuses() { return Array.from(STATUS_MAP.values()).map(cloneJson); },
+      get borders() { return Array.from(borderDefs.values()).map(cloneJson); },
+      get statusCounts() { return getTileStatusCounts(); },
+      refreshConfig: refreshRuntimeConfig,
+      onChange(fn) {
+        if (typeof fn !== 'function') return () => {};
+        runtimeListeners.add(fn);
+        return () => runtimeListeners.delete(fn);
+      },
+    };
+    emitRuntimeChange('api-published');
+  }
 
   // ── Config helpers ─────────────────────────────────────────────────────
   function resolveConfigId(list) {
@@ -262,6 +325,7 @@
       const changed = await fetchTiles();
       if (changed) renderVisibleTiles();
       scheduleSync();
+      emitRuntimeChange('config-switch');
       log(`Switched to config ${configId}.`);
     } finally {
       _switchConfigLock = false;
@@ -281,6 +345,7 @@
     CONFIG = buildConfig(data);
     _serverConfig = data.config ?? null;
     applyServerConfig(_serverConfig);
+    emitRuntimeChange('config-loaded');
     log(`Config loaded: ${CONFIG.gridRows}×${CONFIG.gridCols} tiles, ${CONFIG.tileSizeKm} km each.`);
   }
 
@@ -300,6 +365,7 @@
       if (tile.u) tileUpdatedBy.set(tile.i, tile.u);
       if (tile.v) tileValidatedBy.set(tile.i, tile.v);
     }
+    emitRuntimeChange('tiles-loaded');
     dbg('fetchTiles: loaded', tileStatuses.size, 'tiles');
     return true;
   }
@@ -939,6 +1005,7 @@
       refreshBordersLayer();
       scheduleRender();
     });
+    emitRuntimeChange('tab-ready');
   }
 
   // ── Neighbor status (alt+click) ────────────────────────────────────────
@@ -1061,6 +1128,7 @@
       .then(() => {
         try {
           sdk = UW.getWmeSdk({ scriptId: SCRIPT_ID, scriptName: SCRIPT_NAME });
+          publishRuntimeApi();
         } catch (e) {
           log('getWmeSdk failed:', e);
           return;
