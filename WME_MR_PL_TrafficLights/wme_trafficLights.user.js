@@ -64,7 +64,7 @@
   const DEFAULT_SETTINGS = {
     configId:     null,
     layerVisible: true,
-    colors:       { grid: '#ff0000' },
+    colors:       { grid: null },
     statusColors: {},
     borderLayers: {}, // borderId → { visible?, color? }
   };
@@ -126,6 +126,7 @@
 
   let userSettings = loadSettings();
 
+  let _serverGridColor    = '#ff0000'; // fallback until server config arrives
   let CONFIG              = null; // set after fetchConfig()
   let _serverConfig       = null; // raw config JSON from server, for color reset
   const tileStatuses      = new Map(); // tileId → 1 | 3 | 4 | 5 | 6 | 9
@@ -177,6 +178,7 @@
     for (const [id] of borderDefs) {
       if (isBorderVisible(id)) fetchAndRenderBorderLayer(id);
     }
+    _rebuildGridColorRow();
     _rebuildStatusColorRows();
     _rebuildBorderRows();
     rebuildStatusPanelButtons();
@@ -228,7 +230,11 @@
     if (cfg.borders) {
       for (const b of cfg.borders) borderDefs.set(b.id, b);
     }
-    if (cfg.gridColor) userSettings.colors.grid = cfg.gridColor;
+    if (cfg.gridColor) _serverGridColor = cfg.gridColor;
+  }
+
+  function getEffectiveGridColor() {
+    return userSettings.colors.grid ?? _serverGridColor;
   }
 
   function isBorderVisible(id) {
@@ -323,6 +329,7 @@
       for (const [id] of borderDefs) {
         if (isBorderVisible(id)) fetchAndRenderBorderLayer(id);
       }
+      _rebuildGridColorRow();
       _rebuildStatusColorRows();
       _rebuildBorderRows();
       rebuildStatusPanelButtons();
@@ -446,7 +453,7 @@
           const base = feature?.properties?.status != null ? 0.55 : 0;
           return base * zoomFade(zoomLevel);
         },
-        getStrokeColor:  () => userSettings.colors.grid,
+        getStrokeColor:  () => getEffectiveGridColor(),
         getStrokeOpacity: ({ zoomLevel }) => zoomLevel >= CONFIG.renderZoomMin ? 0.7 : 0,
       },
       styleRules: [
@@ -749,6 +756,12 @@
     });
   }
 
+  function _rebuildGridColorRow() {
+    if (!_configTabPane) return;
+    const input = _configTabPane.querySelector(`#${SCRIPT_ID}__gridColor`);
+    if (input) input.value = getEffectiveGridColor();
+  }
+
   function _rebuildStatusColorRows() {
     if (!_configTabPane) return;
     const container = _configTabPane.querySelector(`#${SCRIPT_ID}__statusColors`);
@@ -949,7 +962,7 @@
         <div style="margin-bottom:8px;font-weight:bold">Kolory:</div>
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
           <label style="flex:1;font-size:13px">Siatka</label>
-          <input type="color" data-color-key="grid" value="${userSettings.colors.grid}"
+          <input type="color" id="${SCRIPT_ID}__gridColor" data-color-key="grid" value="${getEffectiveGridColor()}"
                  style="width:40px;height:28px;border:none;cursor:pointer;border-radius:3px;padding:0">
         </div>
         <div id="${SCRIPT_ID}__statusColors"></div>
@@ -999,9 +1012,10 @@
     tabPane.querySelector(`#${SCRIPT_ID}__resetColors`).addEventListener('click', () => {
       userSettings.statusColors = {};
       userSettings.borderLayers = {};
-      userSettings.colors.grid = DEFAULT_SETTINGS.colors.grid;
+      userSettings.colors.grid = null;
       applyServerConfig(_serverConfig);
       saveSettings();
+      _rebuildGridColorRow();
       _rebuildStatusColorRows();
       _rebuildBorderRows();
       rebuildStatusPanelButtons();
