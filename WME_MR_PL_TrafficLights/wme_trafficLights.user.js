@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                WME MapRaid PL Traffic Lights
 // @name:pl             WME MapRaid PL Sygnalizacja
-// @version             0.6.3
+// @version             0.6.4
 // @tag                 WME
 // @description         MapRaid coordination grid – mark traffic-light work tiles on the map.
 // @description:pl      Siatka koordynacyjna MapRaid – oznaczanie kafelków sygnalizacji świetlnej.
@@ -24,7 +24,7 @@
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   const SCRIPT_ID      = 'WME_MR_PL_TrafficLights';
-  const SCRIPT_VERSION = '0.6.3';
+  const SCRIPT_VERSION = '0.6.4';
   const SCRIPT_NAME = 'MapRaid TL';
   const START_GUARD = '__WME_MAPRAID_TL_BOOTSTRAPPED__';
   const LAYER_NAME         = 'tl.grid';
@@ -63,6 +63,7 @@
   const SETTINGS_KEY = SCRIPT_ID;
   const DEFAULT_SETTINGS = {
     configId:     null,
+    layerVisible: true,
     colors:       { grid: '#ff0000' },
     statusColors: {},
     borderLayers: {}, // borderId → { visible?, color? }
@@ -84,7 +85,9 @@
       if (!raw) return structuredClone(DEFAULT_SETTINGS);
       const stored = JSON.parse(raw);
       if (!stored.configs) return structuredClone(DEFAULT_SETTINGS);
-      return _mergePerConfig(stored, stored.configId);
+      const merged = _mergePerConfig(stored, stored.configId);
+      merged.layerVisible = stored.layerVisible ?? DEFAULT_SETTINGS.layerVisible;
+      return merged;
     } catch (_) {
       return structuredClone(DEFAULT_SETTINGS);
     }
@@ -94,7 +97,8 @@
     try {
       const raw = localStorage.getItem(SETTINGS_KEY);
       const stored = (raw && JSON.parse(raw)) || {};
-      stored.configId = userSettings.configId;
+      stored.configId     = userSettings.configId;
+      stored.layerVisible = userSettings.layerVisible;
       stored.configs  = stored.configs ?? {};
       stored.configs[userSettings.configId] = {
         colors:       userSettings.colors,
@@ -131,7 +135,7 @@
   let configEtag      = null;
 
   let sdk            = null;
-  let layerVisible   = true;
+  let layerVisible   = userSettings.layerVisible ?? true;
   let selectedTileId = null;
   let panel          = null;
   let renderTimer    = null;
@@ -458,7 +462,7 @@
     });
 
     try {
-      sdk.LayerSwitcher.addLayerCheckbox({ name: '▸ MapRaid TL Grid', isChecked: true });
+      sdk.LayerSwitcher.addLayerCheckbox({ name: '▸ MapRaid TL Grid', isChecked: layerVisible });
     } catch (_) {
       // LayerSwitcher optional
     }
@@ -1024,6 +1028,7 @@
   }
 
   function handleMapClick(event) {
+    if (!layerVisible) { hideStatusPanel(); return; }
     const zoom = sdk.Map.getZoomLevel();
     if ((!altPressed && zoom < CONFIG.uiZoomMin) || zoom > CONFIG.uiZoomMax) {
       hideStatusPanel();
@@ -1063,6 +1068,8 @@
       eventHandler: (payload) => {
         if (payload?.name === '▸ MapRaid TL Grid') {
           layerVisible = !!payload.checked;
+          userSettings.layerVisible = layerVisible;
+          saveSettings();
           if (!layerVisible) {
             try { sdk.Map.removeAllFeaturesFromLayer({ layerName: LAYER_NAME }); } catch (_) {}
             hideStatusPanel();
