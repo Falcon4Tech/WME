@@ -46,10 +46,10 @@
   if (UW[START_GUARD]) return;
   UW[START_GUARD] = true;
 
-  const DEBUG = false;
   const log   = (...args) => console.log(`[${SCRIPT_NAME}]`, ...args);
+  const dbg   = (...args) => console.debug(`[${SCRIPT_NAME}]`, ...args);
   const warn  = (...args) => console.warn(`[${SCRIPT_NAME}]`, ...args);
-  const dbg   = DEBUG ? (...args) => console.log(`[${SCRIPT_NAME}:dbg]`, ...args) : () => {};
+  const info  = (...args) => console.info(`[${SCRIPT_NAME}]`, ...args);
 
   function parseVersion(v) {
     const [x, y, z] = v.split('.').map(Number);
@@ -676,7 +676,7 @@
         if (res.response?.u) tileUpdatedBy.set(tileId, res.response.u);
       }
     } catch (e) {
-      log('Status update failed, rolling back:', e);
+      warn('Status update failed, rolling back:', e);
       applyTileStatus(tileId, prevStatus, prevUpdatedBy); // rollback; null → delete author
     } finally {
       _pendingTiles.delete(tileId);
@@ -701,14 +701,16 @@
     }
     const delay = SYNC_INTERVAL + Math.random() * 1777;
     syncTimeout = setTimeout(async () => {
+      console.groupCollapsed(`[${SCRIPT_NAME}] sync @ ${new Date().toLocaleTimeString()}`);
       try {
         const changed = await fetchTiles();
         lastSyncTime = Date.now();
         if (changed) renderVisibleTiles();
       } catch (e) {
-        log('Sync error (non-fatal):', e);
+        warn('Sync error (non-fatal):', e);
       } finally {
         scheduleSync();
+        console.groupEnd();
       }
     }, delay);
     dbg(`Sync scheduled in ${(delay / 1000).toFixed(2)}s`);
@@ -730,7 +732,7 @@
       lastSyncTime = Date.now();
       if (changed) renderVisibleTiles();
     } catch (e) {
-      log(`Sync error on ${reason} (non-fatal):`, e);
+      warn(`Sync error on ${reason} (non-fatal):`, e);
     }
     scheduleSync();
   }
@@ -1143,15 +1145,15 @@
       lastSyncTime = Date.now();
       renderVisibleTiles();
       startSync();
-      log(`Ready. ${CONFIG.gridRows}×${CONFIG.gridCols} tiles, ${CONFIG.tileSizeKm} km each.`);
+      info(`Ready. ${CONFIG.gridRows}×${CONFIG.gridCols} tiles, ${CONFIG.tileSizeKm} km each.`);
     } catch (e) {
-      log('Initialization error:', e);
+      warn('Initialization error:', e);
     }
   }
 
   function bootstrap() {
     if (!UW.SDK_INITIALIZED || typeof UW.SDK_INITIALIZED.then !== 'function') {
-      log('window.SDK_INITIALIZED unavailable, aborting.');
+      warn('window.SDK_INITIALIZED unavailable, aborting.');
       return;
     }
 
@@ -1161,7 +1163,7 @@
           sdk = UW.getWmeSdk({ scriptId: SCRIPT_ID, scriptName: SCRIPT_NAME });
           publishRuntimeApi();
         } catch (e) {
-          log('getWmeSdk failed:', e);
+          warn('getWmeSdk failed:', e);
           return;
         }
 
@@ -1172,9 +1174,9 @@
 
         sdk.Events.once({ eventName: 'wme-ready' })
           .then(() => initScript())
-          .catch((e) => log('wme-ready error:', e));
+          .catch((e) => warn('wme-ready error:', e));
       })
-      .catch((e) => log('SDK_INITIALIZED rejected:', e));
+      .catch((e) => warn('SDK_INITIALIZED rejected:', e));
   }
 
   bootstrap();
