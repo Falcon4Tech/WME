@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                WME MapRaid PL Traffic Lights
 // @name:pl             WME MapRaid PL Sygnalizacja
-// @version             0.6.4
+// @version             0.6.5
 // @tag                 WME
 // @description         MapRaid coordination grid – mark traffic-light work tiles on the map.
 // @description:pl      Siatka koordynacyjna MapRaid – oznaczanie kafelków sygnalizacji świetlnej.
@@ -24,7 +24,7 @@
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   const SCRIPT_ID      = 'WME_MR_PL_TrafficLights';
-  const SCRIPT_VERSION = '0.6.4';
+  const SCRIPT_VERSION = '0.6.5';
   const SCRIPT_NAME = 'MapRaid TL';
   const START_GUARD = '__WME_MAPRAID_TL_BOOTSTRAPPED__';
   const LAYER_NAME         = 'tl.grid';
@@ -48,7 +48,13 @@
 
   const DEBUG = false;
   const log   = (...args) => console.log(`[${SCRIPT_NAME}]`, ...args);
+  const warn  = (...args) => console.warn(`[${SCRIPT_NAME}]`, ...args);
   const dbg   = DEBUG ? (...args) => console.log(`[${SCRIPT_NAME}:dbg]`, ...args) : () => {};
+
+  function parseVersion(v) {
+    const [x, y, z] = v.split('.').map(Number);
+    return x * (1 << 14) + y * (1 << 7) + z;
+  }
 
   // ── State ──────────────────────────────────────────────────────────────
   // null = not yet evaluated (no row in DB)
@@ -350,8 +356,8 @@
 
     configEtag = etag ?? configEtag;
     dbg('fetchConfig: stored configEtag:', configEtag);
-    if (data.version && data.version !== SCRIPT_VERSION) {
-      log(`⚠ Version mismatch: script=${SCRIPT_VERSION}, API=${data.version}. Consider updating.`);
+    if (data.version && parseVersion(data.version) > parseVersion(SCRIPT_VERSION)) {
+      warn(`Version mismatch: script=${SCRIPT_VERSION}, API=${data.version}. Consider updating.`);
     }
     CONFIG = buildConfig(data);
     _serverConfig = data.config ?? null;
@@ -678,7 +684,7 @@
   }
 
   // ── Sync lifecycle ─────────────────────────────────────────────────────
-  const MIN_SYNC_GAP = 5_000; // ms – minimum time between any two syncs
+  const MIN_SYNC_GAP = 15_000; // ms – minimum time between any two syncs
   let syncTimeout    = null;
   let lastSyncTime   = 0;
 
@@ -693,6 +699,7 @@
       dbg('Sync paused (layer hidden or tab in background)');
       return;
     }
+    const delay = SYNC_INTERVAL + Math.random() * 1777;
     syncTimeout = setTimeout(async () => {
       try {
         const changed = await fetchTiles();
@@ -703,8 +710,8 @@
       } finally {
         scheduleSync();
       }
-    }, SYNC_INTERVAL);
-    dbg(`Sync scheduled in ${SYNC_INTERVAL / 1000}s`);
+    }, delay);
+    dbg(`Sync scheduled in ${(delay / 1000).toFixed(2)}s`);
   }
 
   // Run an immediate sync if enough time has passed since last sync,
@@ -810,7 +817,10 @@
       btn.dataset.s = String(status ?? '');
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
-        if (selectedTileId) updateTileStatus(selectedTileId, status);
+        if (selectedTileId) {
+          scheduleSync();
+          updateTileStatus(selectedTileId, status);
+        }
         hideStatusPanel();
       });
       container.appendChild(btn);
