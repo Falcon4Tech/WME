@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                WME MapRaid PL Traffic Lights
 // @name:pl             WME MapRaid PL Sygnalizacja
-// @version             0.6.5
+// @version             0.6.6
 // @tag                 WME
 // @description         MapRaid coordination grid – mark traffic-light work tiles on the map.
 // @description:pl      Siatka koordynacyjna MapRaid – oznaczanie kafelków sygnalizacji świetlnej.
@@ -24,7 +24,7 @@
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   const SCRIPT_ID      = 'WME_MR_PL_TrafficLights';
-  const SCRIPT_VERSION = '0.6.5';
+  const SCRIPT_VERSION = '0.6.6';
   const SCRIPT_NAME = 'MapRaid TL';
   const START_GUARD = '__WME_MAPRAID_TL_BOOTSTRAPPED__';
   const LAYER_NAME         = 'tl.grid';
@@ -1112,8 +1112,34 @@
 
     sdk.Events.on({ eventName: 'wme-map-mouse-click', eventHandler: handleMapClick });
 
-    // Alt key tracking (SdkMouseEvent doesn't carry modifiers).
-    document.addEventListener('keydown', (e) => { if (e.key === 'Alt') { altPressed = true;  e.preventDefault(); } });
+    // Alt key tracking
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Alt') { altPressed = true; e.preventDefault(); return; }
+      if (['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement?.tagName)) return;
+      if (!/^Digit[1-9]$/.test(e.code)) return;
+
+      const idx = Number(e.code[5]) - 1;
+      const btn = statusButtonEls[idx];
+      if (!btn) return;
+
+      if (!e.shiftKey && panel?.style.display !== 'none' && selectedTileId) {
+        btn.click();
+        return;
+      }
+
+      if (e.altKey && layerVisible && CONFIG) {
+        const zoom = sdk.Map.getZoomLevel();
+        if (zoom < CONFIG.uiZoomMin) return;
+        const { lon, lat } = sdk.Map.getMapCenter();
+        const tileId = latLonToTileId(lat, lon);
+        if (!tileId) return;
+        const _ts = tileStatuses.get(tileId);
+        if (STATUS_MAP.get(_ts)?.ro || _ts === 1) return;
+        const status = btn.dataset.s ? Number(btn.dataset.s) : null;
+        scheduleSync();
+        updateTileStatus(tileId, status);
+      }
+    });
     document.addEventListener('keyup',   (e) => { if (e.key === 'Alt') { altPressed = false; } });
     // Reset if focus lost (e.g. alt+tab).
     window.addEventListener('blur', () => { altPressed = false; });
