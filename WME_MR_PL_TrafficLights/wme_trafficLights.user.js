@@ -11,6 +11,7 @@
 // @match             https://*.waze.com/editor*
 // @match             https://*.waze.com/*/editor*
 // @grant             GM_xmlhttpRequest
+// @grant             GM_info
 // @connect           mqtt2api.labtool.pl
 // @connect           raw.githubusercontent.com
 // @supportURL        https://github.com/Falcon4Tech/WME/issues
@@ -24,7 +25,7 @@
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   const SCRIPT_ID      = 'WME_MR_PL_TrafficLights';
-  const SCRIPT_VERSION = '0.6.6';
+  const SCRIPT_VERSION = GM_info.script.version.toString();
   const SCRIPT_NAME = 'MapRaid TL';
   const START_GUARD = '__WME_MAPRAID_TL_BOOTSTRAPPED__';
   const LAYER_NAME         = 'tl.grid';

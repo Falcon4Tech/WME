@@ -118,6 +118,36 @@
         fillOpacity: 0.15
       }
     }
+    ,{
+      id: 'prg-ulice',
+      type: 'wms',
+      name: 'PRG – Ulice',
+      url: 'https://mapy.geoportal.gov.pl/wss/ext/KrajowaIntegracjaNumeracjiAdresowej',
+      version: '1.3.0',
+      requestSrs: 'EPSG:900913',
+      params: {
+        layers: 'prg-ulice',
+        format: 'image/png',
+        transparent: 'TRUE',
+        styles: ''
+      },
+      defaultOn: false
+    }
+    ,{
+      id: 'prg-adresy',
+      type: 'wms',
+      name: 'PRG – Adresy',
+      url: 'https://mapy.geoportal.gov.pl/wss/ext/KrajowaIntegracjaNumeracjiAdresowej',
+      version: '1.3.0',
+      requestSrs: 'EPSG:900913',
+      params: {
+        layers: 'prg-adresy',
+        format: 'image/png',
+        transparent: 'TRUE',
+        styles: ''
+      },
+      defaultOn: false
+    }
   ];
 
   // ---------- Ustawienia localStorage: JSON pod SCRIPT_KEY ----------
@@ -510,7 +540,7 @@
     }
   }
 
-  // ---------- Budowanie requestów WMS (1.1.1) ----------
+  // ---------- Budowanie requestów WMS ----------
   function getUrlAsWms111(bounds) {
     bounds = bounds.clone();
     bounds = this.adjustBounds(bounds);
@@ -542,32 +572,64 @@
   }
 
   function setWmsSrs111(newParams, altUrl) {
-    // Wymuś parametr SRS w stylu WMS 1.1.1
     const srs = this.requestSrs || this.params.SRS;
     if (srs) this.params.SRS = srs;
     if (this.params.CRS) delete this.params.CRS;
     return UW.OpenLayers.Layer.Grid.prototype.getFullRequestString.apply(this, arguments);
   }
 
+  function getUrlAsWms130(bounds) {
+    bounds = bounds.clone();
+    bounds = this.adjustBounds(bounds);
+
+    const imageSize = this.getImageSize(bounds);
+    const newParams = {};
+
+    const mapProj = this.map.getProjectionObject();
+    const mapCode = mapProj?.getCode ? mapProj.getCode() : 'EPSG:900913';
+    const reqSrs = this.requestSrs || this.params.CRS || mapCode;
+
+    if (reqSrs !== mapCode) {
+      try {
+        const reqProj = new UW.OpenLayers.Projection(reqSrs);
+        bounds.transform(mapProj, reqProj);
+      } catch (e) { }
+    }
+
+    newParams.BBOX = bounds.toArray(false);
+    newParams.WIDTH = imageSize.w;
+    newParams.HEIGHT = imageSize.h;
+
+    return this.getFullRequestString(newParams);
+  }
+
+  function setWmsCrs130(newParams, altUrl) {
+    const crs = this.requestSrs || this.params.CRS;
+    if (crs) this.params.CRS = crs;
+    if (this.params.SRS) delete this.params.SRS;
+    return UW.OpenLayers.Layer.Grid.prototype.getFullRequestString.apply(this, arguments);
+  }
+
   // ---------- Tworzenie warstw ----------
   function buildWmsLayer(def, mapSrs) {
     const params = Object.assign({}, def.params);
-
-    // Request SRS: domyślnie projekcja mapy WME.
     const requestSrs = def.requestSrs || mapSrs;
-    params.SRS = requestSrs;
+    const version = def.version || '1.1.1';
+    const isWms130 = version === '1.3.0';
 
-    // Normalizacja nazw parametrów do formatu OpenLayers WMS.
+    if (isWms130) {
+      params.CRS = requestSrs;
+    } else {
+      params.SRS = requestSrs;
+    }
+
     params.layers = params.layers || '';
     params.styles = params.styles ?? '';
     params.format = params.format || 'image/png';
     params.transparent = params.transparent ?? 'TRUE';
-    params.version = def.version || '1.1.1';
-    // Przydatne, gdy serwer zwraca 200 z pustym/przezroczystym kafelkiem.
-    params.exceptions = params.exceptions || 'application/vnd.ogc.se_xml';
+    params.version = version;
+    params.exceptions = params.exceptions || (isWms130 ? 'xml' : 'application/vnd.ogc.se_xml');
 
-    // UWAGA: OpenLayers dopisze SERVICE/REQUEST/VERSION itd.
-    // Polegamy na nadpisaniu getFullRequestString, aby wymusić SRS.
     const layer = new UW.OpenLayers.Layer.WMS(def.name, def.url, params, {
       isBaseLayer: false,
       visibility: false,
@@ -575,8 +637,8 @@
       tileSize: new UW.OpenLayers.Size(1600, 1600),
       buffer: 0,
       transitionEffect: null,
-      getURL: getUrlAsWms111,
-      getFullRequestString: setWmsSrs111
+      getURL: isWms130 ? getUrlAsWms130 : getUrlAsWms111,
+      getFullRequestString: isWms130 ? setWmsCrs130 : setWmsSrs111
     });
     layer.requestSrs = requestSrs;
     return layer;
