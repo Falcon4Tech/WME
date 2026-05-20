@@ -19,6 +19,8 @@
 // @downloadURL       https://raw.githubusercontent.com/Falcon4Tech/WME/main/WME_MR_PL_TrafficLights/wme_trafficLights.user.js
 // ==/UserScript==
 
+/** @typedef {import("../types").WmeSDK} WmeSDK */
+
 (function () {
   'use strict';
 
@@ -142,6 +144,7 @@
   let tilesEtag           = null;
   let configEtag      = null;
 
+  /** @type {WmeSDK | null} */
   let sdk            = null;
   let layerVisible   = userSettings.layerVisible ?? true;
   let selectedTileId = null;

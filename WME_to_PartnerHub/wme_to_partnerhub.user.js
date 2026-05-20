@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name                WME to PartnerHub link
-// @version             1.1.1
+// @version             1.2.0
 // @tag                 WME
 // @description         Adds a PartnerHub link in "Share location" popup for the same lat/lon/zoom.
 // @author              Falcon4Tech
@@ -28,12 +28,19 @@
   const PARTNERHUB_BASE = "https://www.waze.com/partnerhub/map-tool";
   const PARTNER_LABEL = "PartnerHub";
   const PARTNER_PLACEHOLDER = "PartnerHub";
+  const PROD_WRAPPER_ID = "prod-permalink-wrapper";
   const processedPopups = new WeakSet();
   /** @type {WmeSDK | null} */
   let sdk = null;
 
+  const log   = (...args) => console.log(`[${SCRIPT_NAME}]`, ...args);
+
   function getLang() {
-    return (document.documentElement.getAttribute("lang") || "").toLowerCase();
+    try {
+      return sdk?.Settings?.getLocale?.()?.localeCode?.toLowerCase() ?? "";
+    } catch (_) {
+      return (document.documentElement.getAttribute("lang") || "").toLowerCase();
+    }
   }
 
   function getCopyTitle() {
@@ -47,18 +54,10 @@
     return sameWindow ? "Refresh this window" : "Open in new window";
   }
 
-  function parsePermalink(permalink) {
+  function getSdkPermalink() {
     try {
-      const u = new URL(permalink);
-      const lat = u.searchParams.get("lat");
-      const lon = u.searchParams.get("lon");
-      const zoom = u.searchParams.get("zoomLevel") || u.searchParams.get("zoom") || u.searchParams.get("z");
-
-      if (!lat || !lon) return null;
-
-      const z = zoom ? String(parseInt(zoom, 10)) : "20";
-      return { lat: String(lat), lon: String(lon), zoom: z };
-    } catch (e) {
+      return sdk?.Map?.getPermalink?.() ?? null;
+    } catch (_) {
       return null;
     }
   }
@@ -71,53 +70,30 @@
     return u.toString();
   }
 
-  function getPermalinkFromPopup(popupRoot) {
-    const wzPermalink = popupRoot.querySelector('wz-text-input#permalink-input');
-    if (!wzPermalink) return null;
-
-    const attrVal = wzPermalink.getAttribute("value");
-    if (attrVal && attrVal.startsWith("http")) return attrVal;
-
-    const propVal = wzPermalink.value;
-    if (typeof propVal === "string" && propVal.startsWith("http")) return propVal;
-
+  function getPartnerHubUrl() {
     try {
-      const inner = wzPermalink.shadowRoot?.querySelector("input");
-      const innerVal = inner?.value;
-      if (innerVal && innerVal.startsWith("http")) return innerVal;
-    } catch (_) {}
-
-    return null;
+      const { lat, lon } = sdk.Map.getMapCenter();
+      const zoom = sdk.Map.getZoomLevel();
+      return buildPartnerHubUrl({ lat: String(lat), lon: String(lon), zoom: String(zoom) });
+    } catch (_) {
+      return null;
+    }
   }
 
-  function updatePartnerUrl(wrapper, partnerUrl) {
-    if (!wrapper || !partnerUrl) return;
-    wrapper.dataset.partnerUrl = partnerUrl;
-    const input = wrapper.querySelector(`#${PH_INPUT_ID}`);
-    if (!input) return;
-    input.setAttribute("value", partnerUrl);
-    input.value = partnerUrl;
-    try {
-      const inner = input.shadowRoot?.querySelector("input");
-      if (inner) inner.value = partnerUrl;
-    } catch (_) {}
+  function isBetaEditor() {
+    return location.hostname.startsWith("beta.");
   }
 
-  function getPartnerUrlFromWrapper(wrapper) {
-    if (!wrapper) return "";
-    if (wrapper.dataset?.partnerUrl) return wrapper.dataset.partnerUrl;
-    const input = wrapper.querySelector(`#${PH_INPUT_ID}`);
-    if (!input) return "";
-    const attrVal = input.getAttribute("value");
-    if (attrVal && attrVal.startsWith("http")) return attrVal;
-    const propVal = input.value;
-    if (typeof propVal === "string" && propVal.startsWith("http")) return propVal;
+  function getProductionPermalink() {
+    const url = getSdkPermalink();
+    if (!url) return null;
     try {
-      const inner = input.shadowRoot?.querySelector("input");
-      const innerVal = inner?.value;
-      if (innerVal && innerVal.startsWith("http")) return innerVal;
-    } catch (_) {}
-    return "";
+      const u = new URL(url);
+      u.hostname = u.hostname.replace(/^beta\./, "");
+      return u.toString();
+    } catch (_) {
+      return null;
+    }
   }
 
   function copyToClipboard(text) {
@@ -195,31 +171,78 @@
     const openBtn = createPermalinkOpenButton(getOpenTitle(true));
     openBtn.id = PERMALINK_OPEN_ID;
     addIconInteraction(openBtn, () => {
-      const url = getPermalinkFromPopup(popupRoot);
+      const url = getSdkPermalink();
       if (url) window.location.href = url;
     });
     wrapper.appendChild(openBtn);
   }
 
+  function ensureProdPermalinkInPopup(popupRoot) {
+    if (popupRoot.querySelector(`#${PROD_WRAPPER_ID}`)) return;
+    const existingWrapper = popupRoot.querySelector(".permalink-wrapper");
+    if (!existingWrapper?.parentElement) return;
+
+    const prodUrl = getProductionPermalink() || "";
+
+    const wrapper = document.createElement("div");
+    wrapper.id = PROD_WRAPPER_ID;
+    wrapper.className = "permalink-wrapper";
+    wrapper.style.display = "flex";
+    wrapper.style.gap = "8px";
+    wrapper.style.alignItems = "baseline";
+
+    const input = document.createElement("wz-text-input");
+    input.setAttribute("value", prodUrl);
+    input.setAttribute("placeholder", "Permalink");
+    input.setAttribute("autocomplete", "on");
+    input.setAttribute("type", "text");
+    input.setAttribute("size", "md");
+    input.value = prodUrl;
+
+    const copyIcon = document.createElement("i");
+    copyIcon.className = "w-icon w-icon-copy";
+    copyIcon.style.cursor = "pointer";
+    copyIcon.title = getCopyTitle();
+    copyIcon.setAttribute("role", "button");
+    copyIcon.tabIndex = 0;
+
+    const openIcon = createOpenIcon(getOpenTitle(false));
+
+    addIconInteraction(copyIcon, () => {
+      const url = getProductionPermalink();
+      if (url) copyToClipboard(url);
+    });
+
+    addIconInteraction(openIcon, () => {
+      const url = getProductionPermalink();
+      if (url) window.open(url, "_blank", "noopener,noreferrer");
+    });
+
+    copyIcon.style.alignSelf = "flex-start";
+    openIcon.style.alignSelf = "flex-start";
+    copyIcon.style.marginTop = "5px";
+    openIcon.style.marginTop = "6px";
+
+    wrapper.appendChild(input);
+    wrapper.appendChild(copyIcon);
+    wrapper.appendChild(openIcon);
+
+    existingWrapper.parentElement.insertBefore(wrapper, existingWrapper.nextSibling);
+  }
+
   function ensureLinkInPopup(popupRoot) {
-    const permalink = getPermalinkFromPopup(popupRoot);
-    if (!permalink) return;
-
     ensurePermalinkOpenIcon(popupRoot);
+    if (isBetaEditor()) ensureProdPermalinkInPopup(popupRoot);
 
-    const parsed = parsePermalink(permalink);
-    if (!parsed) return;
-
-    const partnerUrl = buildPartnerHubUrl(parsed);
-
-    const existing = popupRoot.querySelector(`#${PH_WRAPPER_ID}`);
-    if (existing) return;
+    if (popupRoot.querySelector(`#${PH_WRAPPER_ID}`)) return;
 
     const content = popupRoot.querySelector(".share-location-popup-content") || popupRoot;
     const anchor =
       popupRoot.querySelector(".coordinates-wrapper") ||
       popupRoot.querySelector(".permalink-wrapper") ||
       content;
+
+    const partnerUrl = getPartnerHubUrl() || "";
 
     const wrapper = document.createElement("div");
     wrapper.id = PH_WRAPPER_ID;
@@ -248,25 +271,35 @@
     const openIcon = createOpenIcon(getOpenTitle(false));
 
     addIconInteraction(copyIcon, () => {
-      const url = getPartnerUrlFromWrapper(wrapper);
-      copyToClipboard(url);
+      const url = getPartnerHubUrl();
+      if (url) copyToClipboard(url);
     });
 
     addIconInteraction(openIcon, () => {
-      const url = getPartnerUrlFromWrapper(wrapper);
+      const url = getPartnerHubUrl();
       if (url) window.open(url, "_blank", "noopener,noreferrer");
     });
 
     wrapper.appendChild(input);
     wrapper.appendChild(copyIcon);
     wrapper.appendChild(openIcon);
-    updatePartnerUrl(wrapper, partnerUrl);
 
     if (anchor && anchor.parentElement) {
       anchor.parentElement.insertBefore(wrapper, anchor.nextSibling);
     } else {
       content.appendChild(wrapper);
     }
+  }
+
+  function overrideGeoLocationButton() {
+    const btn = document.querySelector("wz-button.geo-location-control");
+    if (!btn || btn.dataset.refreshOverridden) return;
+    btn.dataset.refreshOverridden = "1";
+    btn.addEventListener("click", (e) => {
+      e.stopImmediatePropagation();
+      const url = getSdkPermalink();
+      if (url) window.location.href = url;
+    }, true);
   }
 
   function tryInject() {
@@ -292,6 +325,33 @@
     if (rank == null) return false;
     const minRank = Number.parseInt("10", 4);
     return rank >= minRank;
+  }
+
+  function tryInjectErrorDialogButton(node) {
+    const emptyState = node.querySelector('wz-empty-state[image-src*="SystemError"]');
+    if (!emptyState || emptyState.dataset.refreshInjected) return;
+    emptyState.dataset.refreshInjected = "1";
+
+    const btn = document.createElement("wz-button");
+    btn.setAttribute("slot", "button");
+    btn.textContent = getOpenTitle(true);
+    btn.addEventListener("click", () => {
+      const url = getSdkPermalink();
+      window.location.href = url || window.location.href;
+    });
+    emptyState.appendChild(btn);
+  }
+
+  function watchErrorDialog() {
+    const container = document.getElementById("wz-dialog-container");
+    if (!container) return;
+    new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        for (const node of m.addedNodes) {
+          if (node instanceof Element) tryInjectErrorDialogButton(node);
+        }
+      }
+    }).observe(container, { childList: true });
   }
 
   const obs = new MutationObserver((mutations) => {
@@ -321,6 +381,8 @@
         sdk = UW.getWmeSdk({ scriptId: SCRIPT_ID, scriptName: SCRIPT_NAME });
         const onReady = () => {
           tryInject();
+          watchErrorDialog();
+          overrideGeoLocationButton();
           if (sdk?.Events?.on) {
             sdk.Events.on({ eventName: "wme-logged-in", eventHandler: tryInject });
           }
