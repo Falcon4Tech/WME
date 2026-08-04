@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name                WME to PartnerHub link
-// @version             1.2.0
+// @version             1.2.1
 // @tag                 WME
 // @description         Adds a PartnerHub link in "Share location" popup for the same lat/lon/zoom.
 // @author              Falcon4Tech
 // @match               https://*.waze.com/editor*
 // @match               https://*.waze.com/*/editor*
+// @exclude             https://*.waze.com/user/editor*
+// @exclude             https://*.waze.com/*/user/editor*
 // @grant               none
 // @run-at              document-idle
 // @license             MIT

@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name                WME fast RPP
-// @version             0.5.0
+// @version             0.6.2
 // @tag                 WME
 // @description         Fast residential point place (RPP) insertion with smart house number incrementing.
 // @description:pl      Szybkie wstawianie RPP z inteligentną inkrementacją numerów domów.
@@ -9,6 +9,8 @@
 // @namespace           https://wazepolska.pl
 // @match               https://*.waze.com/editor*
 // @match               https://*.waze.com/*/editor*
+// @exclude             https://*.waze.com/user/editor*
+// @exclude             https://*.waze.com/*/user/editor*
 // @grant               none
 // @supportURL          https://github.com/Falcon4Tech/WME/issues
 // @updateURL           https://raw.githubusercontent.com/Falcon4Tech/WME/main/WME_fast_RPP/wme_fast_rpp.meta.js
@@ -42,8 +44,12 @@
 
   /** @type {WmeSDK | null} */
   let sdk        = null;
-  let activeMode = false;
-  let drawing    = false;
+  let activeMode    = false;
+  let drawing       = false;
+  let placementMode = 'RPP'; // 'RPP' | 'HN'
+  let hnActive      = false;
+  let hnAutoConfirm = true;
+  const hnUnsubList = [];
 
   /** @type {string[]} */
   const historyEntries = [];
@@ -173,7 +179,7 @@
 
   // ── UI refs ────────────────────────────────────────────────────────────
   let elCity, elStreet, elNr;
-  // let elCityList; // [old: datalist]
+  let elRppFields, elHnExtra, elHnAutoConfirm, elInstSection;
   let elNumRow, elLetRow;
   let elModeBtn, elSave, elStatus, elHistoryList;
 
@@ -236,6 +242,13 @@
     const style = document.createElement('style');
     style.textContent = `
       #rpp-panel { padding: 8px 10px; font-size: 13px; font-family: sans-serif; }
+      #rpp-mode-select { display: flex; margin-bottom: 8px; border-radius: 6px; overflow: hidden; border: 1px solid #ccc; }
+      .rpp-mode-tab { flex: 1; padding: 6px 0; border: none; border-right: 1px solid #ccc; cursor: pointer; font-size: 12px; font-weight: 700; background: #f5f5f5; color: #666; }
+      .rpp-mode-tab:last-child { border-right: none; }
+      .rpp-mode-tab.active { background: #2196f3; color: #fff; }
+      #rpp-hn-extra { margin: 2px 0 6px; font-size: 12px; color: #555; display: flex; align-items: center; gap: 6px; }
+      #rpp-hn-extra input[type=checkbox] { width: auto; margin: 0; cursor: pointer; }
+      #rpp-hn-extra label { display: inline; font-weight: 400; margin: 0; cursor: pointer; }
       #rpp-panel label { display: block; font-weight: 600; margin: 8px 0 2px; }
       #rpp-panel label span { font-weight: 400; font-size: 11px; color: #999; margin-left: 4px; }
       #rpp-panel input[type=text], #rpp-panel select {
@@ -304,16 +317,22 @@
     const div = document.createElement('div');
     div.id = 'rpp-panel';
     div.innerHTML = `
-      <label>Miasto</label>
-      <!-- [trial: select] -->
-      <select id="rpp-city"><option value="">-- wybierz --</option></select>
-      <!-- [old: text input]
-      <input type="text" id="rpp-city" list="rpp-city-list" autocomplete="off" placeholder="np. Sikorz" />
-      <datalist id="rpp-city-list"></datalist>
-      -->
+      <div id="rpp-mode-select">
+        <button class="rpp-mode-tab active" data-mode="RPP">RPP</button>
+        <button class="rpp-mode-tab" data-mode="HN">HN</button>
+      </div>
 
-      <label>Ulica <span>(puste = nazwa miasta)</span></label>
-      <input type="text" id="rpp-street" autocomplete="off" placeholder="np. Sikorz" />
+      <div id="rpp-rpp-fields">
+        <label>Miasto</label>
+        <select id="rpp-city"><option value="">-- wybierz --</option></select>
+        <label>Ulica <span>(puste = nazwa miasta)</span></label>
+        <input type="text" id="rpp-street" autocomplete="off" placeholder="np. Sikorz" />
+      </div>
+
+      <div id="rpp-hn-extra" style="display:none">
+        <input type="checkbox" id="rpp-hn-autoconfirm" checked />
+        <label for="rpp-hn-autoconfirm">Auto-zatwierdź</label>
+      </div>
 
       <label>Numer domu</label>
       <div id="rpp-nr-row">
@@ -328,6 +347,7 @@
       <div id="rpp-status" class="info"></div>
       <div id="rpp-hist-label">Historia</div>
       <ul id="rpp-history"></ul>
+      <div id="rpp-inst-section">
       <div id="rpp-notes-label">Instrukca</div>
       <p class="info">RPP dodajemy w przypadku braku nazwanej ulicy lub gdy dojazd pod adres jest od strony innej ulicy niż w adresie.</p>
       <ul id="rpp-inst">
@@ -353,28 +373,39 @@
         </ul>
         </li>
       </ul>
+      </div>
     `;
     pane.appendChild(div);
 
-    elCity        = div.querySelector('#rpp-city');
-    elStreet      = div.querySelector('#rpp-street');
-    elNr          = div.querySelector('#rpp-nr');
-    // elCityList = div.querySelector('#rpp-city-list'); // [old: datalist]
-    elNumRow      = div.querySelector('#rpp-num-row');
-    elLetRow      = div.querySelector('#rpp-let-row');
-    elModeBtn     = div.querySelector('#rpp-mode-btn');
-    elSave        = div.querySelector('#rpp-save');
-    elStatus      = div.querySelector('#rpp-status');
-    elHistoryList = div.querySelector('#rpp-history');
+    elCity          = div.querySelector('#rpp-city');
+    elStreet        = div.querySelector('#rpp-street');
+    elNr            = div.querySelector('#rpp-nr');
+    elRppFields     = div.querySelector('#rpp-rpp-fields');
+    elHnExtra       = div.querySelector('#rpp-hn-extra');
+    elHnAutoConfirm = div.querySelector('#rpp-hn-autoconfirm');
+    elInstSection   = div.querySelector('#rpp-inst-section');
+    elNumRow        = div.querySelector('#rpp-num-row');
+    elLetRow        = div.querySelector('#rpp-let-row');
+    elModeBtn       = div.querySelector('#rpp-mode-btn');
+    elSave          = div.querySelector('#rpp-save');
+    elStatus        = div.querySelector('#rpp-status');
+    elHistoryList   = div.querySelector('#rpp-history');
 
     div.querySelector('#rpp-skip').addEventListener('click', () => {
       const { num } = parseHouseNumber(elNr?.value || '');
       if (num !== null && elNr) { elNr.value = String(num + 1); updateRows(); }
     });
 
+    div.querySelectorAll('.rpp-mode-tab').forEach(btn => {
+      btn.addEventListener('click', () => switchPlacementMode(btn.dataset.mode));
+    });
+    elHnAutoConfirm.addEventListener('change', () => {
+      hnAutoConfirm = elHnAutoConfirm.checked;
+      persistPrefs();
+    });
+
     elNr.addEventListener('input', updateRows);
-    elCity.addEventListener('change', () => { persistPrefs(); updateModeUI(); }); // [trial: change for select]
-    // elCity.addEventListener('input', updateModeUI); // [old: input for text]
+    elCity.addEventListener('change', () => { persistPrefs(); updateModeUI(); });
     elStreet.addEventListener('input', updateModeUI);
 
     elModeBtn.addEventListener('click', toggleMode);
@@ -483,34 +514,45 @@
   }
 
   function buildAddressPreview() {
+    if (placementMode === 'HN') return elNr?.value.trim() || '?';
     return formatAddress(elCity?.value.trim(), elStreet?.value.trim(), elNr?.value.trim());
   }
 
   function updateModeUI() {
     if (!elModeBtn) return;
-    if (activeMode) {
+    const isOn = placementMode === 'HN' ? hnActive : activeMode;
+    if (isOn) {
       elModeBtn.textContent = '■ STOP  [Esc]';
       elModeBtn.className = 'active';
-      setStatus(`● Kliknij → ${buildAddressPreview()}`, 'info');
+      const prefix = placementMode === 'HN' ? '● Kliknij w trybie HN →' : '● Kliknij →';
+      setStatus(`${prefix} ${buildAddressPreview()}`, 'info');
     } else {
       elModeBtn.textContent = `▶ START  [${SHORTCUT_KEY.toUpperCase()}]`;
       elModeBtn.className = 'idle';
-      setStatus(`→ ${buildAddressPreview()}`, 'info');
+      const prefix = placementMode === 'HN' ? '→ HN:' : '→';
+      setStatus(`${prefix} ${buildAddressPreview()}`, 'info');
     }
   }
 
   function restorePrefs() {
     const prefs = loadPrefs();
-    // elCity (select) is populated by fillCitySelect() which reads prefs directly
+    // elCity (select) populated by fillCitySelect() which reads prefs directly
     if (elStreet && prefs.streetName) elStreet.value = prefs.streetName;
     if (elNr     && prefs.lastNumber) elNr.value     = prefs.lastNumber;
+    if (prefs.hnAutoConfirm !== undefined) {
+      hnAutoConfirm = prefs.hnAutoConfirm;
+      if (elHnAutoConfirm) elHnAutoConfirm.checked = hnAutoConfirm;
+    }
+    if (prefs.placementMode) switchPlacementMode(prefs.placementMode);
   }
 
   function persistPrefs() {
     savePrefs({
-      cityName:   elCity?.value.trim()   || '',
-      streetName: elStreet?.value.trim() || '',
-      lastNumber: elNr?.value.trim()     || '',
+      cityName:      elCity?.value.trim()   || '',
+      streetName:    elStreet?.value.trim() || '',
+      lastNumber:    elNr?.value.trim()     || '',
+      placementMode,
+      hnAutoConfirm,
     });
   }
 
@@ -565,8 +607,77 @@
     }
   }
 
+  // ── Placement mode switch ─────────────────────────────────────────────
+  function switchPlacementMode(mode) {
+    if (mode === placementMode) return;
+    if (activeMode) { activeMode = false; drawing = false; }
+    if (hnActive) stopHNMode();
+    placementMode = mode;
+    document.querySelectorAll('.rpp-mode-tab').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.mode === mode);
+    });
+    const isHN = mode === 'HN';
+    if (elRppFields)   elRppFields.style.display   = isHN ? 'none' : '';
+    if (elHnExtra)     elHnExtra.style.display      = isHN ? ''     : 'none';
+    if (elInstSection) elInstSection.style.display  = isHN ? 'none' : '';
+    persistPrefs();
+    updateModeUI();
+  }
+
+  // ── HN mode ───────────────────────────────────────────────────────────
+  function onHNMarkerAdded() {
+    const nr = elNr?.value.trim();
+    if (!nr) return;
+    setTimeout(() => {
+      const input = document.querySelector('input.number[size="3"]');
+      if (!input) return;
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      if (setter) setter.call(input, nr);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      if (hnAutoConfirm) input.blur();
+    }, 150);
+  }
+
+  function onHNAdded(houseNumberId) {
+    const nr = elNr?.value.trim();
+    if (!nr) return;
+    try {
+      sdk.DataModel.HouseNumbers.updateHouseNumber({ houseNumberId: String(houseNumberId), number: nr });
+    } catch (_) {}
+    pushHistory(null, null, nr);
+    if (elNr) { elNr.value = autoAdvance(nr); updateRows(); }
+    persistPrefs();
+    setStatus(`✓ HN ${nr}`, 'ok');
+    log('HN added:', nr);
+  }
+
+  function startHNMode() {
+    hnActive = true;
+    updateModeUI();
+    const onMarker = () => onHNMarkerAdded();
+    const onAdded  = ({ houseNumberId }) => onHNAdded(houseNumberId);
+    sdk.Events.on({ eventName: 'wme-map-house-number-marker-added', eventHandler: onMarker });
+    sdk.Events.on({ eventName: 'wme-house-number-added',            eventHandler: onAdded });
+    hnUnsubList.push(
+      () => sdk.Events.off({ eventName: 'wme-map-house-number-marker-added', eventHandler: onMarker }),
+      () => sdk.Events.off({ eventName: 'wme-house-number-added',            eventHandler: onAdded }),
+    );
+  }
+
+  function stopHNMode() {
+    hnUnsubList.forEach(fn => fn());
+    hnUnsubList.length = 0;
+    hnActive = false;
+    updateModeUI();
+  }
+
   // ── Continuous placement mode ──────────────────────────────────────────
   async function toggleMode() {
+    if (placementMode === 'HN') {
+      if (hnActive) stopHNMode(); else startHNMode();
+      return;
+    }
+
     if (activeMode) {
       activeMode = false;
       updateModeUI();

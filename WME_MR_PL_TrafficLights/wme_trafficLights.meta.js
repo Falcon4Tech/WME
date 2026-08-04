@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                WME MapRaid PL Traffic Lights
 // @name:pl             WME MapRaid PL Sygnalizacja
-// @version             0.6.6
+// @version             0.6.7
 // @tag                 WME
 // @description         MapRaid coordination grid – mark traffic-light work tiles on the map.
 // @description:pl      Siatka koordynacyjna MapRaid – oznaczanie kafelków sygnalizacji świetlnej.
@@ -10,7 +10,10 @@
 // @namespace         https://wazepolska.pl
 // @match             https://*.waze.com/editor*
 // @match             https://*.waze.com/*/editor*
+// @exclude           https://*.waze.com/user/editor*
+// @exclude           https://*.waze.com/*/user/editor*
 // @grant             GM_xmlhttpRequest
+// @grant             GM_info
 // @connect           mqtt2api.labtool.pl
 // @connect           raw.githubusercontent.com
 // @supportURL        https://github.com/Falcon4Tech/WME/issues
