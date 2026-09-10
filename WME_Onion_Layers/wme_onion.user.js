@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name                                     WME Onion Layers
 // @name:pl                                     WME Cebula
-// @version                                      Beta.11
+// @version                                      Beta.12
 // @tag                                            WME
 // @description                 Adds custom SDK layers to WME (GeoJSON + raster tiles).
 // @description:pl              Dodaje niestandardowe warstwy SDK do WME (GeoJSON + raster tile).
 // @grant             GM_xmlhttpRequest
 // @connect           cdn.jsdelivr.net
-// @author            Falcon4Tech
+// @author            FalconTech
 // @run-at            document-idle
 // @namespace         https://wazepolska.pl
 // @match             https://*.waze.com/editor*
@@ -29,7 +29,7 @@
 
   const STATE_KEY = SCRIPT_ID;
   const STATE_VERSION = 2;
-  const DEBUG_TILES = true;
+  const DEBUG_TILES = false;
 
   const LAYER_NAME_PREFIX = 'onion.';
   const CHECKBOX_NAME_PREFIX = '⫸ ';
@@ -63,7 +63,9 @@
 
   const DATA_BASE_URL = `https://cdn.jsdelivr.net/gh/Falcon4Tech/WME@main/${SCRIPT_ID}/data`;
 
-  const PROXY_WMS_BASE = 'https://proxy.labtool.pl/wms?url=';
+  const PROXY_WMS_BASE         = 'https://proxy.labtool.pl/wms?url=';
+  const PROXY_HOST             = 'proxy.labtool.pl';
+  const PROXY_REQUEST_DELAY_MS = 50;
   const WEB_MERCATOR_HALF = 20037508.342789244;
 
   const DEFAULT_GEOJSON_STYLE = {
@@ -104,6 +106,7 @@
       tileHeight: 256,
       servers: ['https://proxy.labtool.pl'],
       fileName: 'onion/geoportal-orto-standard~${z}~${x}~${y}@256.jpg',
+      maxZoom: 19, // upstream WMTS (EPSG:3857) has no TileMatrixSetLimits beyond z19
       params: {},
     },
     {
@@ -166,7 +169,7 @@
       type: 'wms-snapped',
       name: 'Ulice',
       defaultOn: false,
-      wmsLayers: 'A08_Ulice_Powierzchnie,A08_Ulice_Linie',
+      wmsLayers: 'A08_Ulice_Linie',
       snapPixels: 256,
       minZoom: 15,
     },
@@ -1298,5 +1301,88 @@
       });
   }
 
+  // ── Proxy tile queue ────────────────────────────────────────────────────────
+  // Intercepts img.src assignments for proxy.labtool.pl tiles, queues them
+  // with center-first sort and PROXY_REQUEST_DELAY_MS between each dispatch.
+
+  let _proxyQueue = [];
+  let _proxyTimer = null;
+
+  function _proxyDistSq(url) {
+    try {
+      const c = UW.W?.map?.getCenter();
+      if (!c) return 0;
+      const cx = c.lon;
+      const cy = c.lat;
+
+      // WMS tile: .../wms?url=<encoded-inner-url-with-BBOX=minx,miny,maxx,maxy>
+      const qi = url.indexOf('?url=');
+      if (qi !== -1) {
+        const inner = decodeURIComponent(url.slice(qi + 5));
+        const m = inner.match(/[?&]BBOX=(-?[\d.]+),(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)/i);
+        if (m) {
+          const dx = (+m[1] + +m[3]) / 2 - cx;
+          const dy = (+m[2] + +m[4]) / 2 - cy;
+          return dx * dx + dy * dy;
+        }
+      }
+
+      // XYZ tile: ~z~x~y@size
+      const t = url.match(/~(\d+)~(\d+)~(\d+)@/);
+      if (t) {
+        const n = 2 ** +t[1];
+        const lon = (+t[2] + 0.5) / n * 360 - 180;
+        const latRad = Math.atan(Math.sinh(Math.PI * (1 - 2 * (+t[3] + 0.5) / n)));
+        const mx = lon * WEB_MERCATOR_HALF / 180;
+        const my = Math.log(Math.tan(Math.PI / 4 + latRad / 2)) * WEB_MERCATOR_HALF / Math.PI;
+        return (mx - cx) ** 2 + (my - cy) ** 2;
+      }
+    } catch (_) {}
+    return 0;
+  }
+
+  function _proxyFlush() {
+    _proxyTimer = null;
+    if (!_proxyQueue.length) return;
+    _proxyQueue.forEach(q => { q.dist = _proxyDistSq(q.url); });
+    _proxyQueue.sort((a, b) => a.dist - b.dist);
+    const next = _proxyQueue.shift();
+    next.fire();
+    if (_proxyQueue.length) {
+      _proxyTimer = setTimeout(_proxyFlush, PROXY_REQUEST_DELAY_MS);
+    }
+  }
+
+  function _proxyEnqueue(url, img, fire) {
+    _proxyQueue = _proxyQueue.filter(q => q.img !== img);
+    _proxyQueue.push({ url, img, dist: _proxyDistSq(url), fire });
+    if (!_proxyTimer) {
+      _proxyTimer = setTimeout(_proxyFlush, 0);
+    }
+  }
+
+  function installProxyImageQueue() {
+    const proto = UW.HTMLImageElement?.prototype;
+    if (!proto) return;
+    const desc = Object.getOwnPropertyDescriptor(proto, 'src');
+    if (!desc?.set) return;
+    const nativeSet = desc.set;
+
+    Object.defineProperty(proto, 'src', {
+      get: desc.get,
+      set(value) {
+        if (typeof value === 'string' && value.includes(PROXY_HOST)) {
+          const img = this;
+          _proxyEnqueue(value, img, () => nativeSet.call(img, value));
+        } else {
+          nativeSet.call(this, value);
+        }
+      },
+      configurable: true,
+    });
+    log('Proxy tile queue ready — delay:', PROXY_REQUEST_DELAY_MS, 'ms, center-first sort.');
+  }
+
+  installProxyImageQueue();
   bootstrapWithSdk();
 })();
