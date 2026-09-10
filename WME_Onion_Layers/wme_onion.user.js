@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name                                     WME Onion Layers
 // @name:pl                                     WME Cebula
-// @version                                       Beta.1.1
+// @version                                      Beta.11
 // @tag                                            WME
-// @description                 Adds Polish WMS overlays from e-mapa.net to WME (works only in Poland territory).
-// @description:pl              Cebula ma warstwy, WME ma WMSy! Dodaje polskie nakładki WMS z e-mapa.net do WME.
+// @description                 Adds custom SDK layers to WME (GeoJSON + raster tiles).
+// @description:pl              Dodaje niestandardowe warstwy SDK do WME (GeoJSON + raster tile).
 // @grant             GM_xmlhttpRequest
 // @connect           cdn.jsdelivr.net
 // @author            Falcon4Tech
@@ -12,8 +12,6 @@
 // @namespace         https://wazepolska.pl
 // @match             https://*.waze.com/editor*
 // @match             https://*.waze.com/*/editor*
-// @exclude           https://*.waze.com/user/editor*
-// @exclude           https://*.waze.com/*/user/editor*
 // @supportURL        https://github.com/Falcon4Tech/WME/issues
 // @icon              https://polska.e-mapa.net/implementation/polska/images/icon.ico
 // @updateURL         https://raw.githubusercontent.com/Falcon4Tech/WME/main/WME_Onion_Layers/wme_onion.meta.js
@@ -25,584 +23,638 @@
 
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
-  const SCRIPT_KEY = 'WME_Onion_Layers';
+  const SCRIPT_ID = 'WME_Onion_Layers';
   const SCRIPT_NAME = 'WME Cebula';
+  const START_GUARD = '__WME_ONION_SDK_BOOTSTRAPPED__';
 
-  const DATA_BASE_URL = `https://cdn.jsdelivr.net/gh/Falcon4Tech/WME@main/${SCRIPT_KEY}/data/`;
+  const STATE_KEY = SCRIPT_ID;
+  const STATE_VERSION = 2;
+  const DEBUG_TILES = true;
 
-  const log = (...a) => console.log(`🗺️ ${SCRIPT_NAME}`, ...a);
+  const LAYER_NAME_PREFIX = 'onion.';
+  const CHECKBOX_NAME_PREFIX = '⫸ ';
+  const ROADS_LAYER_NAME = 'segments';
+  const ROW_BASE_LAYER_ID = 'row_live_base';
+  const GEOPORTAL_STANDARD_LAYER_ID = 'geoportal_orto_standard';
+  const GRANICE_LAYER_ID = 'granice';
+  const MIASTA_LAYER_ID = 'miasta';
+  const PRG_ULICE_LAYER_ID = 'prg-ulice';
+  const PRG_ADRESY_LAYER_ID = 'prg-adresy';
+  const PRG_PLACE_LAYER_ID = 'prg-place';
 
-  // Referencje do UI w runtime
-  const UI = {
-    groupSwitch: null,
-    layerItems: [], // { def, layer, checkbox }
-    runtimeLayers: {} // { [id]: boolean } – dla warstw z saveState:false
-  };
-
-
-  // === Konfiguracja warstw ===
-  // Opcjonalnie per warstwa:
-  //   requestSrs: 'EPSG:900913' | 'EPSG:3857' | 'EPSG:4326'
-  //   saveState: true|false  (domyślnie true; false = brak zapisu do localStorage)
-  const LAYERS = [
-    {
-      id: 'opp',
-      type: 'wms',
-      name: 'OPP - fotoradary',
-      url: 'https://wms.e-mapa.net/cgi-bin/mapserv7',
-      version: '1.1.1',
-      requestSrs: 'EPSG:4326',
-      params: {
-        map: '/home/www/emapa/shp2wms/fotoradary/fotoradary.map',
-        layers: 'projektowane,istniejace',
-        format: 'image/png',
-        transparent: 'TRUE',
-        styles: ''
-      },
-      defaultOn: false
-    },
-    {
-      id: 'granice',
-      type: 'wms',
-      name: 'Granice - obręby',
-      url: 'https://granice.e-mapa.net/cgi-bin/granice_prg',
-      version: '1.1.1',
-      requestSrs: 'EPSG:4326',
-      params: {
-        layers: 'obreby,jednostki',
-        format: 'image/png',
-        transparent: 'TRUE',
-        styles: ''
-      },
-      defaultOn: false
-    },
-    {
-      id: 'miasta',
-      type: 'wms',
-      name: 'Miasta',
-      url: 'https://granice.e-mapa.net/cgi-bin/mapserv',
-      version: '1.1.1',
-      requestSrs: 'EPSG:4326',
-      params: {
-        map: '/srv/webgis/polska/miasta.map',
-        layers: 'miasta',
-        format: 'image/png',
-        transparent: 'TRUE',
-        styles: ''
-      },
-      defaultOn: false
-    }
-    ,{
-      id: 'sct-warszawa',
-      type: 'geojson',
-      name: 'SCT – Warszawa',
-      defaultOn: false,
-      saveState: false,
-      style: {
-        strokeColor: '#ff0000',
-        strokeWidth: 3,
-        strokeOpacity: 0.9,
-        fillColor: '#ff0000',
-        fillOpacity: 0.15
-      }
-    }
-    ,{
-      id: 'sct-krakow',
-      type: 'geojson',
-      name: 'SCT – Kraków',
-      defaultOn: false,
-      saveState: false,
-      style: {
-        strokeColor: '#ff0000',
-        strokeWidth: 3,
-        strokeOpacity: 0.9,
-        fillColor: '#ff0000',
-        fillOpacity: 0.15
-      }
-    }
-    ,{
-      id: 'prg-ulice',
-      type: 'wms',
-      name: 'PRG – Ulice',
-      url: 'https://mapy.geoportal.gov.pl/wss/ext/KrajowaIntegracjaNumeracjiAdresowej',
-      version: '1.3.0',
-      requestSrs: 'EPSG:900913',
-      params: {
-        layers: 'prg-ulice',
-        format: 'image/png',
-        transparent: 'TRUE',
-        styles: ''
-      },
-      defaultOn: false
-    }
-    ,{
-      id: 'prg-adresy',
-      type: 'wms',
-      name: 'PRG – Adresy',
-      url: 'https://mapy.geoportal.gov.pl/wss/ext/KrajowaIntegracjaNumeracjiAdresowej',
-      version: '1.3.0',
-      requestSrs: 'EPSG:900913',
-      params: {
-        layers: 'prg-adresy',
-        format: 'image/png',
-        transparent: 'TRUE',
-        styles: ''
-      },
-      defaultOn: false
-    }
+  // Basemaps should live below WME roads.
+  const BASEMAP_LAYER_IDS = [
+    ROW_BASE_LAYER_ID,
+    GEOPORTAL_STANDARD_LAYER_ID,
   ];
 
-  // ---------- Ustawienia localStorage: JSON pod SCRIPT_KEY ----------
-  const DEFAULT_STATE = {
-    groupEnabled: true,
-    groupCollapsed: false,
-    layers: {}
+  // Overlays should live above WME roads.
+  // wms-snapped layers manage their own DOM element and z-index; they are not listed here.
+  const OVERLAY_LAYER_IDS = [
+    GRANICE_LAYER_ID,
+    MIASTA_LAYER_ID,
+  ];
+
+  const ROW_TARGET_ZINDEX_FALLBACK = 2011;
+  const ROW_OFFSET_BELOW_ROADS = 49;
+  const OVERLAY_TARGET_ZINDEX_FALLBACK = 2200;
+  const OVERLAY_OFFSET_ABOVE_ROADS = 10;
+  const MAX_REASONABLE_ROADS_ZINDEX = 2150;
+
+  const DATA_BASE_URL = `https://cdn.jsdelivr.net/gh/Falcon4Tech/WME@main/${SCRIPT_ID}/data`;
+
+  const PROXY_WMS_BASE = 'https://proxy.labtool.pl/wms?url=';
+  const WEB_MERCATOR_HALF = 20037508.342789244;
+
+  const DEFAULT_GEOJSON_STYLE = {
+    strokeColor: '#ff0000',
+    strokeWidth: 3,
+    strokeOpacity: 0.9,
+    fillColor: '#ff0000',
+    fillOpacity: 0.15,
   };
 
-  // Odczyt stanu z localStorage z bezpiecznym fallbackiem na domyślne wartości.
-  function readState() {
+  if (UW[START_GUARD]) {
+    return;
+  }
+  UW[START_GUARD] = true;
+
+  const log = (...args) => console.log(`[${SCRIPT_NAME}]`, ...args);
+
+  const LAYERS = [
+    {
+      id: 'row_live_base',
+      type: 'tile',
+      name: 'ROW LiveMap',
+      defaultOn: false,
+      tileWidth: 256,
+      tileHeight: 256,
+      servers: ['https://www.waze.com'],
+      fileName: 'row-tiles/live/base/${z}/${x}/${y}/tile.png',
+      params: {
+        'highres': true,
+      },
+    },
+    {
+      id: GEOPORTAL_STANDARD_LAYER_ID,
+      type: 'tile',
+      name: 'Geoportal Orto',
+      defaultOn: false,
+      tileWidth: 256,
+      tileHeight: 256,
+      servers: ['https://proxy.labtool.pl'],
+      fileName: 'onion/geoportal-orto-standard~${z}~${x}~${y}@256.jpg',
+      params: {},
+    },
+    {
+      id: GRANICE_LAYER_ID,
+      type: 'tile',
+      name: 'Granice - obręby',
+      defaultOn: false,
+      tileWidth: 1024,
+      tileHeight: 1024,
+      servers: ['https://proxy.labtool.pl'],
+      fileName: 'onion/granice~${z}~${x}~${y}@1024.png',
+      minZoom: 13,
+      params: {},
+    },
+    {
+      id: MIASTA_LAYER_ID,
+      type: 'tile',
+      name: 'Miasta',
+      defaultOn: false,
+      tileWidth: 512,
+      tileHeight: 512,
+      servers: ['https://proxy.labtool.pl'],
+      fileName: 'onion/miasta~${z}~${x}~${y}@512.png',
+      params: {},
+    },
+    {
+      id: 'kieg-dzialki',
+      type: 'tile',
+      name: 'Działki',
+      defaultOn: false,
+      tileWidth: 1024,
+      tileHeight: 1024,
+      servers: ['https://proxy.labtool.pl'],
+      fileName: 'onion/kieg-dzialki~${z}~${x}~${y}@1024.png',
+      minZoom: 15,
+      params: {},
+    },
+    {
+      id: 'sct-warszawa',
+      type: 'geojson',
+      name: 'SCT - Warszawa',
+      defaultOn: false,
+      saveState: false,
+      lazyLoad: true,
+      dataUrl: `${DATA_BASE_URL}/sct-warszawa.geojson`,
+      styleRules: [{ style: DEFAULT_GEOJSON_STYLE }],
+    },
+    {
+      id: 'sct-krakow',
+      type: 'geojson',
+      name: 'SCT - Krakow',
+      defaultOn: false,
+      saveState: false,
+      lazyLoad: true,
+      dataUrl: `${DATA_BASE_URL}/sct-krakow.geojson`,
+      styleRules: [{ style: DEFAULT_GEOJSON_STYLE }],
+    },
+    {
+      id: PRG_ULICE_LAYER_ID,
+      type: 'wms-snapped',
+      name: 'Ulice',
+      defaultOn: false,
+      wmsLayers: 'A08_Ulice_Powierzchnie,A08_Ulice_Linie',
+      snapPixels: 256,
+      minZoom: 15,
+    },
+    {
+      id: PRG_ADRESY_LAYER_ID,
+      type: 'wms-snapped',
+      name: 'Adresy',
+      defaultOn: false,
+      wmsLayers: 'A07_Punkty_adresowe',
+      snapPixels: 256,
+      minZoom: 17,
+    },
+    {
+      id: PRG_PLACE_LAYER_ID,
+      type: 'wms-snapped',
+      name: 'Miejsca',
+      defaultOn: false,
+      wmsLayers: 'prg-place',
+      snapPixels: 256,
+      minZoom: 15,
+    },
+  ];
+
+  const RUNTIME = {
+    initialized: false,
+    layerByCheckboxName: new Map(),
+    layerById: new Map(),
+    sdk: null,
+    sessionLayerState: new Map(),
+    state: null,
+    stopEventListeners: [],
+    zIndexSyncTimer: null,
+  };
+
+  function normalizeBooleanRecord(value) {
+    const result = {};
+    if (!value || typeof value !== 'object') return result;
+
+    for (const [key, val] of Object.entries(value)) {
+      if (typeof val === 'boolean') {
+        result[key] = val;
+      }
+    }
+    return result;
+  }
+
+  function getDefaultState() {
+    return {
+      version: STATE_VERSION,
+      layers: {},
+    };
+  }
+
+  function parseState(raw) {
+    if (!raw) {
+      return { migrated: false, state: getDefaultState() };
+    }
+
+    let parsed;
     try {
-      const raw = localStorage.getItem(SCRIPT_KEY);
-      if (!raw) return { ...DEFAULT_STATE };
-      const parsed = JSON.parse(raw);
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      return { migrated: true, state: getDefaultState() };
+    }
+
+    if (parsed && typeof parsed === 'object' && parsed.version === STATE_VERSION) {
       return {
-        groupEnabled: typeof parsed.groupEnabled === 'boolean' ? parsed.groupEnabled : DEFAULT_STATE.groupEnabled,
-        groupCollapsed: typeof parsed.groupCollapsed === 'boolean' ? parsed.groupCollapsed : DEFAULT_STATE.groupCollapsed,
-        layers: parsed.layers && typeof parsed.layers === 'object' ? parsed.layers : {}
+        migrated: false,
+        state: {
+          version: STATE_VERSION,
+          layers: normalizeBooleanRecord(parsed.layers),
+        },
       };
-    } catch (e) {
-      return { ...DEFAULT_STATE };
+    }
+
+    // Legacy V1 shape: { groupEnabled, groupCollapsed, layers: { [id]: boolean } }
+    if (parsed && typeof parsed === 'object' && parsed.layers && typeof parsed.layers === 'object') {
+      return {
+        migrated: true,
+        state: {
+          version: STATE_VERSION,
+          layers: normalizeBooleanRecord(parsed.layers),
+        },
+      };
+    }
+
+    // Defensive migration for any stale format.
+    return { migrated: true, state: getDefaultState() };
+  }
+
+  function persistState() {
+    localStorage.setItem(STATE_KEY, JSON.stringify(RUNTIME.state));
+  }
+
+  function initializeState() {
+    const raw = localStorage.getItem(STATE_KEY);
+    const { state, migrated } = parseState(raw);
+    RUNTIME.state = state;
+
+    if (migrated) {
+      persistState();
     }
   }
 
-  function writeState(next) {
-    localStorage.setItem(SCRIPT_KEY, JSON.stringify(next));
+  function shouldPersistLayerState(layerDefinition) {
+    return layerDefinition.saveState !== false;
   }
 
-  function shouldSaveLayerState(def) {
-    return def?.saveState !== false;
-  }
+  function getWantedLayerState(layerDefinition) {
+    if (!layerDefinition) return false;
 
-  function getWantedLayerState(def) {
-    if (!def) return false;
-
-    // Warstwy "sesyjne" (bez zapisu do localStorage)
-    if (!shouldSaveLayerState(def)) {
-      if (typeof UI.runtimeLayers[def.id] === 'boolean') return UI.runtimeLayers[def.id];
-      return !!def.defaultOn;
+    if (!shouldPersistLayerState(layerDefinition)) {
+      if (RUNTIME.sessionLayerState.has(layerDefinition.id)) {
+        return RUNTIME.sessionLayerState.get(layerDefinition.id);
+      }
+      return !!layerDefinition.defaultOn;
     }
 
-    // Warstwy zapisywane w localStorage
-    const st = readState();
-    const v = st.layers?.[def.id];
-    if (typeof v === 'boolean') return v;
-    return !!def.defaultOn;
+    const stored = RUNTIME.state.layers[layerDefinition.id];
+    if (typeof stored === 'boolean') {
+      return stored;
+    }
+
+    return !!layerDefinition.defaultOn;
   }
 
-  function setWantedLayerState(def, enabled) {
-    if (!def) return;
+  function setWantedLayerState(layerDefinition, enabled) {
+    if (!layerDefinition) return;
 
-    if (!shouldSaveLayerState(def)) {
-      UI.runtimeLayers[def.id] = !!enabled;
+    if (!shouldPersistLayerState(layerDefinition)) {
+      RUNTIME.sessionLayerState.set(layerDefinition.id, !!enabled);
       return;
     }
 
-    const st = readState();
-    st.layers = st.layers || {};
-    st.layers[def.id] = !!enabled;
-    writeState(st);
+    RUNTIME.state.layers[layerDefinition.id] = !!enabled;
+    persistState();
   }
 
-  function getGroupEnabled(fallback = true) {
-    const st = readState();
-    return typeof st.groupEnabled === 'boolean' ? st.groupEnabled : !!fallback;
+  function getLayerName(layerDefinition) {
+    return `${LAYER_NAME_PREFIX}${layerDefinition.id}`;
   }
 
-  function setGroupEnabled(enabled) {
-    const st = readState();
-    st.groupEnabled = !!enabled;
-    // Natywnie: gdy grupa jest wyłączona, zostaje zwinięta.
-    if (!st.groupEnabled) st.groupCollapsed = true;
-    writeState(st);
+  function getCheckboxName(layerDefinition) {
+    return `${CHECKBOX_NAME_PREFIX}${layerDefinition.name}`;
   }
 
-  function getGroupCollapsed(fallback = false) {
-    const st = readState();
-    return typeof st.groupCollapsed === 'boolean' ? st.groupCollapsed : !!fallback;
+  function isAlreadyExistsError(error) {
+    if (!error || error.name !== 'InvalidStateError') return false;
+    const message = String(error.message ?? '').toLowerCase();
+    return message.includes('already exists');
   }
 
-  function setGroupCollapsed(collapsed) {
-    const st = readState();
-    st.groupCollapsed = !!collapsed;
-    writeState(st);
+  function isMissingStateError(error) {
+    if (!error || error.name !== 'InvalidStateError') return false;
+    const message = String(error.message ?? '').toLowerCase();
+    return message.includes('does not exist') || message.includes('not found');
   }
 
-  // ---------- Czekanie na WME ----------
-  function whenWmeReady(cb) {
-    const tick = () => {
-      try {
-        if (UW.W && UW.W.map && UW.OpenLayers) cb();
-        else setTimeout(tick, 800);
-      } catch (e) {
-        setTimeout(tick, 800);
-      }
-    };
-    tick();
-  }
-
-
-  function getLayerSwitcherUL() {
-    // Główna lista z grupami: <ul class="list-unstyled togglers">
-    const menuRoot = document.querySelector('#layer-switcher-region .menu .scrollable ul.list-unstyled.togglers')
-      || document.querySelector('#layer-switcher-region .menu ul.list-unstyled.togglers')
-      || document.querySelector('#layer-switcher-region .menu .list-unstyled.togglers');
-    if (!menuRoot) return null;
-
-    // Odrzuć, jeśli grupa już istnieje
-    const existing = menuRoot.querySelector('li.group[data-custom-group="onion"] ul');
-    if (existing) return existing;
-
-    // Wstawiamy przed grupą "Widok"
-    const displayToggle = menuRoot.querySelector('#layer-switcher-group_display');
-    const displayGroupLi = displayToggle ? displayToggle.closest('li.group') : null;
-
-    const liGroup = document.createElement('li');
-    liGroup.className = 'group';
-    liGroup.dataset.customGroup = 'onion';
-
-    const header = document.createElement('div');
-    header.className = 'layer-switcher-toggler-tree-category';
-
-    const caretBtn = document.createElement('wz-button');
-    caretBtn.setAttribute('color', 'clear-icon');
-    caretBtn.setAttribute('size', 'xs');
-    caretBtn.setAttribute('type', 'button');
-
-    const caretIcon = document.createElement('i');
-    caretIcon.className = 'toggle-category w-icon w-icon-caret-down';
-    caretBtn.appendChild(caretIcon);
-
-    const groupSwitch = document.createElement('wz-toggle-switch');
-    groupSwitch.className = 'layer-switcher-group_onion';
-    groupSwitch.id = 'layer-switcher-group_onion';
-    groupSwitch.setAttribute('tabindex', '0');
-
-    // Przywróć stan z localStorage
-    const initialGroupEnabled = getGroupEnabled(true);
-    UI.groupSwitch = groupSwitch;
-    setSwitchChecked(groupSwitch, initialGroupEnabled);
-
-    const label = document.createElement('label');
-    label.className = 'label-text';
-    label.setAttribute('for', 'layer-switcher-group_onion');
-    label.textContent = 'Warstwy';
-
-    header.appendChild(caretBtn);
-    header.appendChild(groupSwitch);
-    header.appendChild(label);
-
-    const ul = document.createElement('ul');
-    ul.className = 'collapsible-GROUP_ONION';
-
-    // Zwiń/rozwiń jak natywne WME (klasa CSS + odwrócona strzałka)
-    const COLLAPSE_CLASS = 'collapse-layer-switcher-group';
-
-    const syncCollapseUI = (collapsed) => {
-      if (collapsed) ul.classList.add(COLLAPSE_CLASS);
-      else ul.classList.remove(COLLAPSE_CLASS);
-
-      caretIcon.className = collapsed
-        ? 'toggle-category w-icon w-icon-caret-down upside-down'
-        : 'toggle-category w-icon w-icon-caret-down';
-    };
-
-    const applyGroupEnabledUI = (enabled) => {
-      // Natywne: gdy WYŁ. => wymuszone zwinięcie
-      if (!enabled) {
-        syncCollapseUI(true);
-      } else {
-        syncCollapseUI(getGroupCollapsed(false));
-      }
-    };
-
-    // Strzałka zwija/rozwija TYLKO gdy grupa jest włączona
-    caretBtn.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-
-      const enabled = getSwitchChecked(groupSwitch);
-      if (!enabled) return;
-
-      const nextCollapsed = !ul.classList.contains(COLLAPSE_CLASS);
-      setGroupCollapsed(nextCollapsed);
-      syncCollapseUI(nextCollapsed);
-    });
-
-    liGroup.appendChild(header);
-    liGroup.appendChild(ul);
-
-    if (displayGroupLi && displayGroupLi.parentElement === menuRoot) {
-      menuRoot.insertBefore(liGroup, displayGroupLi);
-    } else {
-      menuRoot.appendChild(liGroup);
-    }
-
-    wireToggleSwitch(groupSwitch, (enabled) => {
-      setGroupEnabled(enabled);
-
-      // UX: po włączeniu grupy automatycznie ją rozwiń.
-      if (enabled) setGroupCollapsed(false);
-
-      applyGroupEnabledUI(enabled);
-      applyGroupState();
-    });
-
-    // Stan początkowy: OFF => wymuszone zwinięcie, inaczej użyj zapisanego
-    applyGroupEnabledUI(initialGroupEnabled);
-
-    // Upewnij się, że warstwy i checkboxy od razu odzwierciedlają stan grupy
-    applyGroupState();
-
-    return ul;
-  }
-
-  // --- Helpery dla wz-toggle-switch / wz-checkbox ---
-  function getSwitchChecked(el) {
-    if (!el) return true;
-    if (typeof el.checked === 'boolean') return !!el.checked;
-    return el.hasAttribute('checked');
-  }
-
-  function setSwitchChecked(el, checked) {
-    if (!el) return;
-    // większość buildów reaguje na atrybut `checked`
-    if (checked) el.setAttribute('checked', '');
-    else el.removeAttribute('checked');
-
-    // część buildów ma też property `checked`
-    try { el.checked = !!checked; } catch (e) { /* ignore */ }
-  }
-
-  function setCheckboxDisabled(el, disabled) {
-    if (!el) return;
-    if (disabled) el.setAttribute('disabled', '');
-    else el.removeAttribute('disabled');
-  }
-  function wireToggleSwitch(toggleEl, onToggle) {
-    if (!toggleEl) return;
-
-    const fire = () => {
-      try {
-        onToggle(getSwitchChecked(toggleEl));
-      } catch (e) {
-        // ignoruj
-      }
-    };
-
-    // Minimal: host events only
-    toggleEl.addEventListener('change', () => setTimeout(fire, 0));
-    toggleEl.addEventListener('click', () => setTimeout(fire, 0));
-  }
-
-  function applyGroupState() {
-    const groupEnabled = getGroupEnabled(true);
-
-    for (const item of UI.layerItems) {
-      const wanted = getWantedLayerState(item.def);
-
-      // Nie nadpisuj wyboru użytkownika dla warstwy, gdy grupa jest wyłączona.
-      // Tylko wymuszamy niewidoczność na czas wyłączenia grupy.
-      const effective = groupEnabled && wanted;
-      // Lazy-load GeoJSON kiedy ma się stać widoczny
-      if (effective && item.def.type === 'geojson') {
-        // fire-and-forget (nie blokuj UI)
-        ensureGeoJsonLoaded(item);
-      }
-      item.layer.setVisibility(!!effective);
-
-      // Wyłącz checkboxy warstw, gdy grupa jest wyłączona (zachowaj ich stan)
-      if (item.checkbox) {
-        // Zachowaj "checked" zgodnie z zapisanym stanem per warstwa
-        item.checkbox.checked = !!wanted;
-        setCheckboxDisabled(item.checkbox, !groupEnabled);
-      }
-    }
-  }
-
-
-  function addToggleRow(ul, layer, def, defaultChecked) {
-    const li = document.createElement('li');
-
-    const wrap = document.createElement('div');
-    wrap.className = 'layer-selector';
-
-    const chk = document.createElement('wz-checkbox');
-    chk.appendChild(document.createTextNode(layer.name));
-
-    // Checkbox odzwierciedla zapisany wybór dla danej warstwy.
-    chk.checked = !!defaultChecked;
-
-    chk.addEventListener('change', async (e) => {
-      const enabled = !!e.target.checked;
-      setWantedLayerState(def, enabled);
-
-      // Dla GeoJSON dociągnij dane dopiero przy włączeniu.
-      const item = UI.layerItems.find((x) => x.def.id === def.id);
-      if (enabled && item && item.def.type === 'geojson') {
-        await ensureGeoJsonLoaded(item);
-      }
-
-      applyGroupState();
-    });
-
-    wrap.appendChild(chk);
-    li.appendChild(wrap);
-    ul.appendChild(li);
-    return chk;
-  }
-
-  // ---------- GeoJSON (jsDelivr) ----------
-  function httpGetText(url) {
-    return new Promise((resolve, reject) => {
-      if (typeof GM_xmlhttpRequest !== 'function') {
-        reject(new Error('GM_xmlhttpRequest niedostępny (brak @grant lub menedżera userscriptów)'));
-        return;
-      }
-      GM_xmlhttpRequest({
-        method: 'GET',
-        url,
-        onload: (res) => {
-          if (res.status >= 200 && res.status < 300) resolve(res.responseText);
-          else reject(new Error(`HTTP ${res.status} dla ${url}`));
-        },
-        onerror: () => reject(new Error(`Błąd sieci dla ${url}`))
-      });
-    });
-  }
-
-  function buildVectorLayer(def, mapProj) {
-    const style = def.style || {};
-    const styleMap = new UW.OpenLayers.StyleMap({
-      'default': new UW.OpenLayers.Style({
-        strokeColor: style.strokeColor || '#ff0000',
-        strokeWidth: style.strokeWidth ?? 3,
-        strokeOpacity: style.strokeOpacity ?? 0.9,
-        fillColor: style.fillColor || '#ff0000',
-        fillOpacity: style.fillOpacity ?? 0.15
-      })
-    });
-
-    const layer = new UW.OpenLayers.Layer.Vector(def.name, {
-      styleMap,
-      visibility: false
-    });
-
-    // Wewnętrzne flagi runtime
-    layer.__onion = {
-      type: 'geojson',
-      loaded: false,
-      loading: false
-    };
-
-    return layer;
-  }
-
-  async function ensureGeoJsonLoaded(item) {
-    const layer = item.layer;
-    const rt = layer.__onion;
-    if (!rt || rt.loaded || rt.loading) return;
-
-    rt.loading = true;
-    const url = `${DATA_BASE_URL}${item.def.id}.${item.def.type}`;
-
+  function safeSetLayerVisibility(layerName, visibility) {
     try {
-      const text = await httpGetText(url);
-      const geo = JSON.parse(text);
+      RUNTIME.sdk.Map.setLayerVisibility({ layerName, visibility: !!visibility });
+      return true;
+    } catch (error) {
+      if (!isMissingStateError(error)) {
+        log('Failed to set layer visibility:', layerName, error);
+      }
+      return false;
+    }
+  }
 
-      const fmt = new UW.OpenLayers.Format.GeoJSON({
-        externalProjection: new UW.OpenLayers.Projection('EPSG:4326'),
-        internalProjection: UW.W.map.getProjectionObject()
-      });
+  function safeSetLayerZIndex(layerName, zIndex) {
+    try {
+      RUNTIME.sdk.Map.setLayerZIndex({ layerName, zIndex });
+    } catch (error) {
+      if (!isMissingStateError(error)) {
+        log('Failed to set layer z-index:', layerName, error);
+      }
+    }
+  }
 
-      const features = fmt.read(geo);
-      if (features && features.length) {
-        layer.addFeatures(features);
+  function safeGetLayerZIndex(layerName) {
+    try {
+      const value = RUNTIME.sdk.Map.getLayerZIndex({ layerName });
+      return value;
+    } catch (error) {
+      if (!isMissingStateError(error)) {
+        log('Failed to get layer z-index:', layerName, error);
+      }
+      return null;
+    }
+  }
+
+  function resolveRowTargetZIndex() {
+    const roadsZIndex = safeGetLayerZIndex(ROADS_LAYER_NAME);
+
+    if (
+      roadsZIndex !== null &&
+      Number.isFinite(roadsZIndex) &&
+      roadsZIndex <= MAX_REASONABLE_ROADS_ZINDEX
+    ) {
+      return roadsZIndex - ROW_OFFSET_BELOW_ROADS;
+    }
+
+    return ROW_TARGET_ZINDEX_FALLBACK;
+  }
+
+  function resolveOverlayTargetZIndex() {
+    const roadsZIndex = safeGetLayerZIndex(ROADS_LAYER_NAME);
+
+    if (
+      roadsZIndex !== null &&
+      Number.isFinite(roadsZIndex) &&
+      roadsZIndex <= MAX_REASONABLE_ROADS_ZINDEX
+    ) {
+      return roadsZIndex + OVERLAY_OFFSET_ABOVE_ROADS;
+    }
+
+    return OVERLAY_TARGET_ZINDEX_FALLBACK;
+  }
+
+  function applyRelativeLayerStacking() {
+    const targetRowZIndex = resolveRowTargetZIndex();
+    for (const layerId of BASEMAP_LAYER_IDS) {
+      const layerRuntime = RUNTIME.layerById.get(layerId);
+      if (!layerRuntime) continue;
+      if (layerRuntime.definition.type === 'tile' && !layerRuntime.tileRegistered) continue;
+      safeSetLayerZIndex(layerRuntime.layerName, targetRowZIndex);
+    }
+
+    const targetOverlayZIndex = resolveOverlayTargetZIndex();
+    for (const layerId of OVERLAY_LAYER_IDS) {
+      const layerRuntime = RUNTIME.layerById.get(layerId);
+      if (!layerRuntime) continue;
+      if (layerRuntime.definition.type === 'tile' && !layerRuntime.tileRegistered) continue;
+      safeSetLayerZIndex(layerRuntime.layerName, targetOverlayZIndex);
+    }
+  }
+
+  function scheduleRelativeLayerStacking(delayMs = 0) {
+    if (RUNTIME.zIndexSyncTimer !== null) {
+      clearTimeout(RUNTIME.zIndexSyncTimer);
+      RUNTIME.zIndexSyncTimer = null;
+    }
+
+    RUNTIME.zIndexSyncTimer = setTimeout(() => {
+      RUNTIME.zIndexSyncTimer = null;
+      applyRelativeLayerStacking();
+    }, delayMs);
+  }
+
+  // --- Zoom refresh helpers ---
+
+  function getCurrentZoomLevel() {
+    try {
+      return RUNTIME.sdk.Map.getZoomLevel();
+    } catch (error) {
+      log('Failed to read zoom level from SDK:', error);
+      return null;
+    }
+  }
+
+  // Returns true when zoomLevel is within the layer's optional minZoom/maxZoom range.
+  // Missing bounds are treated as unbounded. Null/undefined zoomLevel always passes.
+  function isZoomAllowed(layerDefinition, zoomLevel) {
+    if (zoomLevel === null || zoomLevel === undefined) return true;
+    if (layerDefinition.minZoom !== undefined && zoomLevel < layerDefinition.minZoom) return false;
+    if (layerDefinition.maxZoom !== undefined && zoomLevel > layerDefinition.maxZoom) return false;
+    return true;
+  }
+
+  // Applies zoom-based visibility gating to all tile layers.
+  // Does NOT touch checkbox state or localStorage.
+  async function applyZoomGatingForTiles() {
+    const zoomLevel = getCurrentZoomLevel();
+    for (const [, layerRuntime] of RUNTIME.layerById) {
+      if (layerRuntime.definition.type !== 'tile') continue;
+      const wanted = getWantedLayerState(layerRuntime.definition);
+      if (!wanted) continue;
+      if (!isZoomAllowed(layerRuntime.definition, zoomLevel)) {
+        safeSetLayerVisibility(layerRuntime.layerName, false);
       } else {
-        log('GeoJSON bez obiektów:', item.def.id);
+        ensureTileLayerRegistered(layerRuntime);
+        safeSetLayerVisibility(layerRuntime.layerName, true);
       }
-
-      rt.loaded = true;
-    } catch (e) {
-      log('Błąd ładowania GeoJSON:', item.def.id, e);
-      // Jeśli nie udało się załadować, wyłącz warstwę w stanie użytkownika.
-      setWantedLayerState(item.def, false);
-      if (item.checkbox) item.checkbox.checked = false;
-    } finally {
-      rt.loading = false;
     }
   }
 
-  // ---------- Budowanie requestów WMS ----------
-  function getUrlAsWms111(bounds) {
-    bounds = bounds.clone();
-    bounds = this.adjustBounds(bounds);
+  // During zoom animation WME may keep showing tiles from the previous zoom level.
+  // For noisy overlay layers (WMS-rendered tiles like borders/labels) this looks bad.
+  // Now, overlays are simply refreshed without debounce.
+  function scheduleOverlayTileRefreshAfterZoom() {
+    const zoomLevel = getCurrentZoomLevel();
 
-    const imageSize = this.getImageSize(bounds);
-    const newParams = {};
+    for (const layerId of OVERLAY_LAYER_IDS) {
+      const layerRuntime = RUNTIME.layerById.get(layerId);
+      if (!layerRuntime) continue;
+      if (layerRuntime.definition.type !== 'tile') continue;
 
-    const mapProj = this.map.getProjectionObject();
-    const mapCode = mapProj?.getCode ? mapProj.getCode() : 'EPSG:900913';
+      const wanted = getWantedLayerState(layerRuntime.definition);
+      if (!wanted) continue;
 
-    // Żądany SRS dla serwera WMS (domyślnie: taki jak mapa)
-    const reqSrs = this.requestSrs || this.params.SRS || mapCode;
+      if (!isZoomAllowed(layerRuntime.definition, zoomLevel)) {
+        safeSetLayerVisibility(layerRuntime.layerName, false);
+        continue;
+      }
 
-    // Transformuj BBOX tylko na potrzeby requestu
-    if (reqSrs !== mapCode) {
-      try {
-        const reqProj = new UW.OpenLayers.Projection(reqSrs);
-        bounds.transform(mapProj, reqProj);
-      } catch (e) {
-        // jeśli transformacja nie jest dostępna, zostaw BBOX w projekcji mapy
+      ensureTileLayerRegistered(layerRuntime);
+      safeSetLayerVisibility(layerRuntime.layerName, true);
+    }
+
+    // Refresh composite WMS layers — their sublayer zoom gates may have changed.
+    for (const [, layerRuntime] of RUNTIME.layerById) {
+      if (layerRuntime.definition.type === 'wms-composite') {
+        applyCompositeLayerVisibility(layerRuntime);
       }
     }
 
-    newParams.BBOX = bounds.toArray(false);
-    newParams.WIDTH = imageSize.w;
-    newParams.HEIGHT = imageSize.h;
-
-    return this.getFullRequestString(newParams);
+    // Reload snapped WMS layers — resolution changes per zoom level.
+    updateAllSnappedLayers();
   }
 
-  function setWmsSrs111(newParams, altUrl) {
-    const srs = this.requestSrs || this.params.SRS;
-    if (srs) this.params.SRS = srs;
-    if (this.params.CRS) delete this.params.CRS;
-    return UW.OpenLayers.Layer.Grid.prototype.getFullRequestString.apply(this, arguments);
+  function safeSetLayerCheckboxChecked(checkboxName, isChecked) {
+    try {
+      const current = RUNTIME.sdk.LayerSwitcher.isLayerCheckboxChecked({ name: checkboxName });
+      if (current !== !!isChecked) {
+        RUNTIME.sdk.LayerSwitcher.setLayerCheckboxChecked({ name: checkboxName, isChecked: !!isChecked });
+      }
+    } catch (error) {
+      if (!isMissingStateError(error)) {
+        log('Failed to set checkbox state:', checkboxName, error);
+      }
+    }
   }
+
+  function ensureScriptSdk() {
+    if (typeof UW.getWmeSdk !== 'function') {
+      throw new Error('window.getWmeSdk is unavailable');
+    }
+
+    return UW.getWmeSdk({
+      scriptId: SCRIPT_ID,
+      scriptName: SCRIPT_NAME,
+    });
+  }
+
+  function requestText(url) {
+    if (typeof GM_xmlhttpRequest === 'function') {
+      return new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          onerror: () => reject(new Error(`Network error for ${url}`)),
+          onload: (response) => {
+            if (response.status >= 200 && response.status < 300) {
+              resolve(response.responseText);
+              return;
+            }
+            reject(new Error(`HTTP ${response.status} for ${url}`));
+          },
+          url,
+        });
+      });
+    }
+
+    return fetch(url).then((response) => {
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} for ${url}`);
+      }
+      return response.text();
+    });
+  }
+
+  function normalizeFeatureProperties(properties) {
+    if (!properties || typeof properties !== 'object') {
+      return undefined;
+    }
+
+    const result = {};
+    for (const [key, value] of Object.entries(properties)) {
+      if (value === null || typeof value === 'string' || typeof value === 'number') {
+        result[key] = value;
+      } else if (typeof value === 'boolean') {
+        result[key] = String(value);
+      }
+    }
+
+    return Object.keys(result).length ? result : undefined;
+  }
+
+  function splitGeometryToAtomic(geometry) {
+    if (!geometry || typeof geometry !== 'object' || typeof geometry.type !== 'string') {
+      return [];
+    }
+
+    switch (geometry.type) {
+      case 'Point':
+      case 'LineString':
+      case 'Polygon':
+        return [geometry];
+      case 'MultiPoint':
+        return Array.isArray(geometry.coordinates)
+          ? geometry.coordinates.map((coordinates) => ({ type: 'Point', coordinates }))
+          : [];
+      case 'MultiLineString':
+        return Array.isArray(geometry.coordinates)
+          ? geometry.coordinates.map((coordinates) => ({ type: 'LineString', coordinates }))
+          : [];
+      case 'MultiPolygon':
+        return Array.isArray(geometry.coordinates)
+          ? geometry.coordinates.map((coordinates) => ({ type: 'Polygon', coordinates }))
+          : [];
+      case 'GeometryCollection': {
+        if (!Array.isArray(geometry.geometries)) {
+          return [];
+        }
+
+        const parts = [];
+        for (const innerGeometry of geometry.geometries) {
+          parts.push(...splitGeometryToAtomic(innerGeometry));
+        }
+        return parts;
+      }
+      default:
+        return [];
+    }
+  }
+
+  function normalizeSourceFeatures(geojson) {
+    if (!geojson || typeof geojson !== 'object') {
+      return [];
+    }
+
+    if (geojson.type === 'FeatureCollection') {
+      return Array.isArray(geojson.features) ? geojson.features : [];
+    }
+
+    if (geojson.type === 'Feature') {
+      return [geojson];
+    }
+
+    return [
+      {
+        geometry: geojson,
+        properties: {},
+        type: 'Feature',
+      },
+    ];
+  }
+
+  function buildSdkFeatures(layerDefinition, geojson) {
+    const sourceFeatures = normalizeSourceFeatures(geojson);
+    const sdkFeatures = [];
+    let index = 0;
+
+    for (const sourceFeature of sourceFeatures) {
+      const atomicGeometries = splitGeometryToAtomic(sourceFeature.geometry);
+      if (!atomicGeometries.length) continue;
+
+      const properties = normalizeFeatureProperties(sourceFeature.properties);
+
+      for (const geometry of atomicGeometries) {
+        sdkFeatures.push({
+          geometry,
+          id: `${layerDefinition.id}-${index}`,
+          properties,
+          type: 'Feature',
+        });
+        index += 1;
+      }
+    }
+
+    return sdkFeatures;
+  }
+
+  // ---------- WMS 1.3.0 URL builders (OpenLayers hooks) ----------
 
   function getUrlAsWms130(bounds) {
     bounds = bounds.clone();
     bounds = this.adjustBounds(bounds);
-
     const imageSize = this.getImageSize(bounds);
-    const newParams = {};
-
     const mapProj = this.map.getProjectionObject();
     const mapCode = mapProj?.getCode ? mapProj.getCode() : 'EPSG:900913';
     const reqSrs = this.requestSrs || this.params.CRS || mapCode;
-
     if (reqSrs !== mapCode) {
       try {
-        const reqProj = new UW.OpenLayers.Projection(reqSrs);
-        bounds.transform(mapProj, reqProj);
-      } catch (e) { }
+        bounds.transform(mapProj, new UW.OpenLayers.Projection(reqSrs));
+      } catch (_) { }
     }
-
-    newParams.BBOX = bounds.toArray(false);
-    newParams.WIDTH = imageSize.w;
-    newParams.HEIGHT = imageSize.h;
-
-    return this.getFullRequestString(newParams);
+    return this.getFullRequestString({ BBOX: bounds.toArray(false), WIDTH: imageSize.w, HEIGHT: imageSize.h });
   }
 
   function setWmsCrs130(newParams, altUrl) {
@@ -612,117 +664,639 @@
     return UW.OpenLayers.Layer.Grid.prototype.getFullRequestString.apply(this, arguments);
   }
 
-  // ---------- Tworzenie warstw ----------
-  function buildWmsLayer(def, mapSrs) {
-    const params = Object.assign({}, def.params);
-    const requestSrs = def.requestSrs || mapSrs;
-    const version = def.version || '1.1.1';
-    const isWms130 = version === '1.3.0';
-
-    if (isWms130) {
-      params.CRS = requestSrs;
-    } else {
-      params.SRS = requestSrs;
-    }
-
-    params.layers = params.layers || '';
-    params.styles = params.styles ?? '';
-    params.format = params.format || 'image/png';
-    params.transparent = params.transparent ?? 'TRUE';
-    params.version = version;
-    params.exceptions = params.exceptions || (isWms130 ? 'xml' : 'application/vnd.ogc.se_xml');
-
-    const layer = new UW.OpenLayers.Layer.WMS(def.name, def.url, params, {
+  function buildWmsOlLayer(definition) {
+    const layer = new UW.OpenLayers.Layer.WMS(definition.name, definition.url, {
+      layers: '',
+      styles: '',
+      format: 'image/png',
+      transparent: 'TRUE',
+      version: definition.version || '1.3.0',
+      exceptions: 'xml',
+      CRS: definition.requestSrs || 'EPSG:3857',
+    }, {
       isBaseLayer: false,
       visibility: false,
       singleTile: false,
-      tileSize: new UW.OpenLayers.Size(1600, 1600),
+      tileSize: new UW.OpenLayers.Size(1024, 1024),
       buffer: 0,
       transitionEffect: null,
-      getURL: isWms130 ? getUrlAsWms130 : getUrlAsWms111,
-      getFullRequestString: isWms130 ? setWmsCrs130 : setWmsSrs111
+      getURL: getUrlAsWms130,
+      getFullRequestString: setWmsCrs130,
     });
-    layer.requestSrs = requestSrs;
+    layer.requestSrs = definition.requestSrs || 'EPSG:3857';
     return layer;
   }
 
-  function init() {
-    const map = UW.W.map;
+  // ---------- WMS composite layer ----------
 
-    // Bez duplikatów
-    const already = map.getLayersByName(LAYERS[0].name);
-    if (already && already.length) {
-      log('Already initialized; skipping.');
+  function getActiveSublayerWmsNames(compositeDefinition) {
+    const zoomLevel = getCurrentZoomLevel();
+    return compositeDefinition.sublayers
+      .filter(sub => {
+        if (!getWantedLayerState(sub)) return false;
+        if (sub.minZoom !== undefined && zoomLevel !== null && zoomLevel < sub.minZoom) return false;
+        return true;
+      })
+      .map(sub => sub.wmsName);
+  }
+
+  function applyCompositeLayerVisibility(compositeRuntime) {
+    if (!compositeRuntime.olLayer) return;
+    const activeNames = getActiveSublayerWmsNames(compositeRuntime.definition);
+    if (activeNames.length === 0) {
+      compositeRuntime.olLayer.setVisibility(false);
+      return;
+    }
+    compositeRuntime.olLayer.mergeNewParams({ layers: activeNames.join(',') });
+    compositeRuntime.olLayer.setVisibility(true);
+  }
+
+  function registerWmsCompositeLayer(layerDefinition) {
+    const olLayer = buildWmsOlLayer(layerDefinition);
+    UW.W.map.addLayer(olLayer);
+    olLayer.setZIndex(2200);
+
+    const layerRuntime = {
+      checkboxName: getCheckboxName(layerDefinition),
+      definition: layerDefinition,
+      geojsonLoaded: false,
+      geojsonLoadPromise: null,
+      layerName: getLayerName(layerDefinition),
+      olLayer,
+      tileRegistered: false,
+      sublayerRuntimes: [],
+    };
+
+    // Try parent group checkbox (graceful fallback if SDK build doesn't support it)
+    let groupSupported = false;
+    try {
+      if (typeof RUNTIME.sdk.LayerSwitcher.addLayerCheckboxGroup === 'function') {
+        RUNTIME.sdk.LayerSwitcher.addLayerCheckboxGroup({ name: layerRuntime.checkboxName });
+        groupSupported = true;
+      }
+    } catch (_) { }
+
+    for (const sub of layerDefinition.sublayers) {
+      const subCheckboxName = `${CHECKBOX_NAME_PREFIX}${sub.name}`;
+      const subChecked = getWantedLayerState(sub);
+
+      const subRuntime = {
+        checkboxName: subCheckboxName,
+        definition: sub,
+        compositeRuntime: layerRuntime,
+      };
+
+      layerRuntime.sublayerRuntimes.push(subRuntime);
+      RUNTIME.layerByCheckboxName.set(subCheckboxName, subRuntime);
+
+      try {
+        const opts = { isChecked: subChecked, name: subCheckboxName };
+        if (groupSupported) opts.groupName = layerRuntime.checkboxName;
+        RUNTIME.sdk.LayerSwitcher.addLayerCheckbox(opts);
+      } catch (error) {
+        if (!isAlreadyExistsError(error)) throw error;
+        safeSetLayerCheckboxChecked(subCheckboxName, subChecked);
+      }
+    }
+
+    RUNTIME.layerById.set(layerDefinition.id, layerRuntime);
+  }
+
+  async function ensureGeoJsonLayerLoaded(layerRuntime) {
+    if (layerRuntime.geojsonLoaded) {
+      return true;
+    }
+
+    if (layerRuntime.geojsonLoadPromise) {
+      return layerRuntime.geojsonLoadPromise;
+    }
+
+    layerRuntime.geojsonLoadPromise = (async () => {
+      try {
+        const payload = await requestText(layerRuntime.definition.dataUrl);
+        const parsed = JSON.parse(payload);
+        const features = buildSdkFeatures(layerRuntime.definition, parsed);
+
+        if (features.length) {
+          RUNTIME.sdk.Map.addFeaturesToLayer({
+            features,
+            layerName: layerRuntime.layerName,
+          });
+        }
+
+        layerRuntime.geojsonLoaded = true;
+        return true;
+      } catch (error) {
+        log('GeoJSON load failed:', layerRuntime.definition.id, error);
+        return false;
+      } finally {
+        layerRuntime.geojsonLoadPromise = null;
+      }
+    })();
+
+    return layerRuntime.geojsonLoadPromise;
+  }
+
+  async function applyLayerVisibility(layerRuntime, visibility, options = {}) {
+    const nextVisibility = !!visibility;
+
+    if (layerRuntime.definition.type === 'geojson' && nextVisibility) {
+      const loaded = await ensureGeoJsonLayerLoaded(layerRuntime);
+      if (!loaded) {
+        setWantedLayerState(layerRuntime.definition, false);
+
+        if (options.syncCheckbox !== false) {
+          safeSetLayerCheckboxChecked(layerRuntime.checkboxName, false);
+        }
+
+        safeSetLayerVisibility(layerRuntime.layerName, false);
+        return;
+      }
+    }
+
+    if (layerRuntime.definition.type === 'tile' && nextVisibility) {
+      ensureTileLayerRegistered(layerRuntime);
+    }
+
+    safeSetLayerVisibility(layerRuntime.layerName, nextVisibility);
+  }
+
+  function registerTileLayer(layerRuntime) {
+    const definition = layerRuntime.definition;
+    try {
+      RUNTIME.sdk.Map.addTileLayer({
+        layerName: layerRuntime.layerName,
+        layerOptions: {
+          tileHeight: definition.tileHeight,
+          tileWidth: definition.tileWidth,
+          url: {
+            fileName: definition.fileName,
+            params: definition.params || {},
+            servers: definition.servers,
+          },
+        },
+      });
+    } catch (error) {
+      if (!isAlreadyExistsError(error)) {
+        throw error;
+      }
+    }
+  }
+
+  // Registers a tile layer in the SDK on first use.
+  // Idempotent: does nothing if already registered or if layerRuntime is not a tile layer.
+  function ensureTileLayerRegistered(layerRuntime) {
+    if (layerRuntime.definition.type !== 'tile' || layerRuntime.tileRegistered) return;
+    registerTileLayer(layerRuntime); // swallows "already exists", throws on other errors
+    layerRuntime.tileRegistered = true;
+  }
+
+  function registerGeoJsonLayer(layerRuntime) {
+    const definition = layerRuntime.definition;
+    try {
+      RUNTIME.sdk.Map.addLayer({
+        layerName: layerRuntime.layerName,
+        styleRules: Array.isArray(definition.styleRules) && definition.styleRules.length
+          ? definition.styleRules
+          : [{ style: DEFAULT_GEOJSON_STYLE }],
+        zIndexing: true,
+      });
+    } catch (error) {
+      if (!isAlreadyExistsError(error)) {
+        throw error;
+      }
+    }
+  }
+
+  function registerDebugOverlays() {
+    for (const layerDefinition of LAYERS) {
+      if (layerDefinition.type !== 'tile') continue;
+      const debugLayerName = `${getLayerName(layerDefinition)}.debug`;
+      const r = layerDefinition.tileWidth || 512;
+      try {
+        RUNTIME.sdk.Map.addTileLayer({
+          layerName: debugLayerName,
+          layerOptions: {
+            tileHeight: r,
+            tileWidth: r,
+            url: {
+              fileName: `onion/debug-border~\${z}~\${x}~\${y}@${r}.svg`,
+              params: {},
+              servers: layerDefinition.servers,
+            },
+          },
+        });
+        safeSetLayerVisibility(debugLayerName, true);
+      } catch (error) {
+        if (!isAlreadyExistsError(error)) {
+          log('Debug overlay registration failed:', layerDefinition.id, error);
+        }
+      }
+    }
+  }
+
+  // ---- wms-snapped helpers ----
+
+  function lonToMercatorX(lon) {
+    return lon * WEB_MERCATOR_HALF / 180;
+  }
+
+  function latToMercatorY(lat) {
+    const rad = lat * Math.PI / 180;
+    return Math.log(Math.tan(Math.PI / 4 + rad / 2)) * WEB_MERCATOR_HALF / Math.PI;
+  }
+
+  function mercatorXToLon(x) {
+    return x * 180 / WEB_MERCATOR_HALF;
+  }
+
+  function mercatorYToLat(y) {
+    return (2 * Math.atan(Math.exp(y * Math.PI / WEB_MERCATOR_HALF)) - Math.PI / 2) * 180 / Math.PI;
+  }
+
+  function getLayerContainerEl() {
+    const viewport = RUNTIME.sdk.Map.getMapViewportElement();
+    return viewport.querySelector('.olLayerContainer') || viewport.firstElementChild || viewport;
+  }
+
+  function buildWmsGetMapUrl(wmsLayers, minX, minY, maxX, maxY, width, height) {
+    const wmsBase = 'https://mapy.geoportal.gov.pl/wss/ext/KrajowaIntegracjaNumeracjiAdresowej';
+    const params = new URLSearchParams([
+      ['SERVICE', 'WMS'],
+      ['REQUEST', 'GetMap'],
+      ['VERSION', '1.3.0'],
+      ['CRS', 'EPSG:3857'],
+      ['LAYERS', wmsLayers],
+      ['STYLES', ''],
+      ['FORMAT', 'image/png'],
+      ['TRANSPARENT', 'TRUE'],
+      ['EXCEPTIONS', 'XML'],
+      ['BBOX', `${minX},${minY},${maxX},${maxY}`],
+      ['WIDTH', String(width)],
+      ['HEIGHT', String(height)],
+    ]);
+    return PROXY_WMS_BASE + encodeURIComponent(`${wmsBase}?${params.toString()}`);
+  }
+
+  function updateSnappedWmsLayer(layerRuntime) {
+    const { definition, snappedImg } = layerRuntime;
+    if (!snappedImg) return;
+
+    const sdk = RUNTIME.sdk;
+    const zoomLevel = getCurrentZoomLevel();
+    const wanted = getWantedLayerState(definition);
+
+    if (!wanted || !isZoomAllowed(definition, zoomLevel)) {
+      snappedImg.style.display = 'none';
       return;
     }
 
-    const ul = getLayerSwitcherUL();
-    if (!ul) {
-      throw new Error('Layer switcher list not found');
-    }
+    const vpEl = sdk.Map.getMapViewportElement();
+    const vpW = vpEl.clientWidth;
+    const vpH = vpEl.clientHeight;
+    const snapPixels = definition.snapPixels || 256;
+    const resolution = sdk.Map.getMapResolution();
 
-    // Pobierz kod SRS mapy do requestów w projekcji mapy
-    const mapSrs = map.getProjectionObject()?.getCode ? map.getProjectionObject().getCode() : 'EPSG:900913';
+    const imgW = Math.max(1024, Math.round(vpW * 0.8));
+    const imgH = Math.max(1024, Math.round(vpH * 0.9));
 
-    for (const def of LAYERS) {
-      const enabled = getWantedLayerState(def);
+    const snapSizeM = snapPixels * resolution;
+    const center = sdk.Map.getMapCenter();
+    const mx = lonToMercatorX(center.lon);
+    const my = latToMercatorY(center.lat);
 
-      let layer;
-      if (def.type === 'geojson') {
-        layer = buildVectorLayer(def, map.getProjectionObject());
-      } else {
-        layer = buildWmsLayer(def, mapSrs);
+    const snappedMx = Math.round(mx / snapSizeM) * snapSizeM;
+    const snappedMy = Math.round(my / snapSizeM) * snapSizeM;
+
+    const halfW = (imgW / 2) * resolution;
+    const halfH = (imgH / 2) * resolution;
+    const url = buildWmsGetMapUrl(
+      definition.wmsLayers,
+      snappedMx - halfW, snappedMy - halfH,
+      snappedMx + halfW, snappedMy + halfH,
+      imgW, imgH,
+    );
+
+    const applyPosition = () => {
+      const pixel = sdk.Map.getMapPixelFromLonLat({
+        lonLat: { lon: mercatorXToLon(snappedMx), lat: mercatorYToLat(snappedMy) },
+      });
+      if (pixel) {
+        // Convert viewport pixel → layer-container pixel so the img follows the map during panning.
+        const container = layerRuntime.snappedContainer;
+        const vpRect = vpEl.getBoundingClientRect();
+        const cRect  = container.getBoundingClientRect();
+        snappedImg.style.left = `${pixel.x - (cRect.left - vpRect.left) - imgW / 2}px`;
+        snappedImg.style.top  = `${pixel.y - (cRect.top  - vpRect.top)  - imgH / 2}px`;
       }
+      snappedImg.style.width  = `${imgW}px`;
+      snappedImg.style.height = `${imgH}px`;
+      snappedImg.style.display = '';
+    };
 
-      map.addLayer(layer);
-      layer.setZIndex(2050);
+    layerRuntime.snappedCenter = { mx: snappedMx, my: snappedMy, imgW, imgH };
 
-      const checkbox = addToggleRow(ul, layer, def, enabled);
-      UI.layerItems.push({ def, layer, checkbox });
-
-      // Jeśli warstwa GeoJSON była już włączona w stanie, spróbuj ją dociągnąć od razu.
-      if (enabled && def.type === 'geojson') {
-        ensureGeoJsonLoaded(UI.layerItems[UI.layerItems.length - 1]);
-      }
+    if (layerRuntime.snappedUrl !== url) {
+      const zoomChanged = layerRuntime.snappedResolution !== resolution;
+      layerRuntime.snappedUrl = url;
+      layerRuntime.snappedResolution = resolution;
+      if (zoomChanged) snappedImg.style.display = 'none';
+      snappedImg.onload = () => { snappedImg.onload = null; applyPosition(); };
+      snappedImg.src = url;
+    } else {
+      applyPosition();
     }
-
-    // Zastosuj stan grupy nadrzędnej (odświeża też checkboxy warstw)
-    applyGroupState();
-
-    // Niektóre buildy WME/OpenLayers potrafią chwilowo ustawić widoczność po dodaniu warstwy.
-    // Ponów po następnym tyknięciu i chwilę później, by stan "grupa wył." wygrał.
-    setTimeout(applyGroupState, 0);
-    setTimeout(applyGroupState, 500);
-
-    log('Initialized.');
   }
 
-  // ---------- Start ----------
-  function initBootstrap() {
+  function updateAllSnappedLayers() {
+    for (const [, layerRuntime] of RUNTIME.layerById) {
+      if (layerRuntime.definition.type === 'wms-snapped') {
+        updateSnappedWmsLayer(layerRuntime);
+      }
+    }
+  }
+
+  function registerSnappedWmsLayer(layerRuntime) {
+    const { definition } = layerRuntime;
+
+    const img = document.createElement('img');
+    img.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;z-index:2250;display:none;';
+    img.alt = '';
+
+    const container = getLayerContainerEl();
+    container.appendChild(img);
+    layerRuntime.snappedImg = img;
+    layerRuntime.snappedContainer = container;
+    layerRuntime.snappedCenter = null;
+
+    const checked = getWantedLayerState(definition);
+
     try {
-      // Czekamy aż menu warstw będzie gotowe
-      if (document.getElementById('layer-switcher-group_display') != null && getLayerSwitcherUL()) {
-        init();
-      } else {
-        setTimeout(initBootstrap, 800);
-      }
-    } catch (e) {
-      setTimeout(initBootstrap, 800);
+      RUNTIME.sdk.LayerSwitcher.addLayerCheckbox({
+        isChecked: checked,
+        name: layerRuntime.checkboxName,
+      });
+    } catch (error) {
+      if (!isAlreadyExistsError(error)) throw error;
+      safeSetLayerCheckboxChecked(layerRuntime.checkboxName, checked);
+    }
+
+    RUNTIME.layerByCheckboxName.set(layerRuntime.checkboxName, layerRuntime);
+    RUNTIME.layerById.set(definition.id, layerRuntime);
+
+    if (checked) {
+      updateSnappedWmsLayer(layerRuntime);
     }
   }
 
-  whenWmeReady(() => {
-    initBootstrap();
-  });
+  // ---- end wms-snapped ----
 
-  // === Dodanie nowych warstw do LAYERS[] ===
-  // LAYERS.push({
-  //   id: 'nowa',
-  //   name: 'Nowa warstwa',
-  //   url: 'https://example.com/wms',
-  //   version: '1.1.1',
-  //   params: { layers: 'foo', format: 'image/png', transparent: 'TRUE', styles: '' },
-  //   defaultOn: false
-  // });
+  function registerLayerInSdk(layerDefinition) {
+    if (layerDefinition.type === 'wms-composite') {
+      registerWmsCompositeLayer(layerDefinition);
+      return;
+    }
 
+    if (layerDefinition.type === 'wms-snapped') {
+      const layerRuntime = {
+        checkboxName: getCheckboxName(layerDefinition),
+        definition: layerDefinition,
+        layerName: getLayerName(layerDefinition),
+        snappedImg: null,
+        snappedContainer: null,
+        snappedCenter: null,
+        snappedUrl: null,
+        snappedResolution: null,
+      };
+      registerSnappedWmsLayer(layerRuntime);
+      return;
+    }
+
+    const layerRuntime = {
+      checkboxName: getCheckboxName(layerDefinition),
+      definition: layerDefinition,
+      geojsonLoaded: false,
+      geojsonLoadPromise: null,
+      layerName: getLayerName(layerDefinition),
+      tileRegistered: false,
+    };
+
+    const checked = getWantedLayerState(layerDefinition);
+
+    if (layerDefinition.type === 'tile') {
+      // Only register in SDK if layer should be ON — avoids tile requests on startup.
+      if (checked) {
+        ensureTileLayerRegistered(layerRuntime);
+      }
+    } else if (layerDefinition.type === 'geojson') {
+      registerGeoJsonLayer(layerRuntime);
+    } else {
+      throw new Error(`Unsupported layer type: ${layerDefinition.type}`);
+    }
+
+    try {
+      RUNTIME.sdk.LayerSwitcher.addLayerCheckbox({
+        isChecked: checked,
+        name: layerRuntime.checkboxName,
+      });
+    } catch (error) {
+      if (!isAlreadyExistsError(error)) {
+        throw error;
+      }
+
+      safeSetLayerCheckboxChecked(layerRuntime.checkboxName, checked);
+    }
+
+    RUNTIME.layerByCheckboxName.set(layerRuntime.checkboxName, layerRuntime);
+    RUNTIME.layerById.set(layerDefinition.id, layerRuntime);
+  }
+
+  async function syncLayerRuntimeState(layerRuntime) {
+    if (layerRuntime.definition.type === 'wms-composite') {
+      for (const subRuntime of layerRuntime.sublayerRuntimes) {
+        safeSetLayerCheckboxChecked(subRuntime.checkboxName, getWantedLayerState(subRuntime.definition));
+      }
+      applyCompositeLayerVisibility(layerRuntime);
+      return;
+    }
+
+    if (layerRuntime.definition.type === 'wms-snapped') {
+      safeSetLayerCheckboxChecked(layerRuntime.checkboxName, getWantedLayerState(layerRuntime.definition));
+      updateSnappedWmsLayer(layerRuntime);
+      return;
+    }
+
+    const wanted = getWantedLayerState(layerRuntime.definition);
+
+    safeSetLayerCheckboxChecked(layerRuntime.checkboxName, wanted);
+
+    if (layerRuntime.definition.type === 'tile') {
+      // Registration and zoom-gated visibility for tiles are fully handled by
+      // applyZoomGatingForTiles(), called right after syncAllLayersRuntimeState().
+      // We only need to hide tiles that are already registered but no longer wanted.
+      if (!wanted && layerRuntime.tileRegistered) {
+        safeSetLayerVisibility(layerRuntime.layerName, false);
+      }
+      return;
+    }
+
+    await applyLayerVisibility(layerRuntime, wanted, { syncCheckbox: false });
+  }
+
+  async function syncAllLayersRuntimeState() {
+    const layers = Array.from(RUNTIME.layerById.values());
+    for (const layerRuntime of layers) {
+      await syncLayerRuntimeState(layerRuntime);
+    }
+  }
+
+  async function onLayerCheckboxToggled(payload) {
+    if (!payload || typeof payload.name !== 'string') {
+      return;
+    }
+
+    const layerRuntime = RUNTIME.layerByCheckboxName.get(payload.name);
+    if (!layerRuntime) {
+      return;
+    }
+
+    // Composite sub-checkbox toggle
+    if (layerRuntime.compositeRuntime) {
+      setWantedLayerState(layerRuntime.definition, !!payload.checked);
+      applyCompositeLayerVisibility(layerRuntime.compositeRuntime);
+      scheduleRelativeLayerStacking(0);
+      return;
+    }
+
+    const checked = !!payload.checked;
+    setWantedLayerState(layerRuntime.definition, checked);
+    if (layerRuntime.definition.type === 'wms-snapped') {
+      updateSnappedWmsLayer(layerRuntime);
+      scheduleRelativeLayerStacking(0);
+      return;
+    }
+    if (layerRuntime.definition.type === 'tile' && checked) {
+      // For tile ON: use zoom-aware gating (may defer registration if zoom out of range).
+      await applyZoomGatingForTiles();
+    } else {
+      await applyLayerVisibility(layerRuntime, checked);
+    }
+    scheduleRelativeLayerStacking(0);
+  }
+
+  function onMapLayerStackChanged() {
+    scheduleRelativeLayerStacking(50);
+  }
+
+  function registerEventListeners() {
+    for (const stop of RUNTIME.stopEventListeners) {
+      try {
+        stop();
+      } catch (error) {
+        log('Failed to stop event listener:', error);
+      }
+    }
+    RUNTIME.stopEventListeners = [];
+
+    RUNTIME.stopEventListeners.push(RUNTIME.sdk.Events.on({
+      eventHandler: onLayerCheckboxToggled,
+      eventName: 'wme-layer-checkbox-toggled',
+    }));
+
+    RUNTIME.stopEventListeners.push(RUNTIME.sdk.Events.on({
+      eventHandler: onMapLayerStackChanged,
+      eventName: 'wme-map-layer-added',
+    }));
+
+    RUNTIME.stopEventListeners.push(RUNTIME.sdk.Events.on({
+      eventHandler: onMapLayerStackChanged,
+      eventName: 'wme-map-layer-changed',
+    }));
+
+    RUNTIME.stopEventListeners.push(RUNTIME.sdk.Events.on({
+      eventHandler: onMapLayerStackChanged,
+      eventName: 'wme-map-layer-removed',
+    }));
+
+    RUNTIME.stopEventListeners.push(RUNTIME.sdk.Events.on({
+      eventHandler: updateAllSnappedLayers,
+      eventName: 'wme-map-move-end',
+    }));
+
+    // Zoom change events (names vary across SDK builds; register a few common ones).
+    RUNTIME.stopEventListeners.push(RUNTIME.sdk.Events.on({
+      eventHandler: scheduleOverlayTileRefreshAfterZoom,
+      eventName: 'wme-zoom-changed',
+    }));
+
+    RUNTIME.stopEventListeners.push(RUNTIME.sdk.Events.on({
+      eventHandler: scheduleOverlayTileRefreshAfterZoom,
+      eventName: 'wme-map-zoom-changed',
+    }));
+
+    RUNTIME.stopEventListeners.push(RUNTIME.sdk.Events.on({
+      eventHandler: scheduleOverlayTileRefreshAfterZoom,
+      eventName: 'wme-map-zoom-level-changed',
+    }));
+  }
+
+  async function initializeScript() {
+    if (RUNTIME.initialized) {
+      return;
+    }
+    RUNTIME.initialized = true;
+
+    initializeState();
+
+    try {
+      for (const layerDefinition of LAYERS) {
+        registerLayerInSdk(layerDefinition);
+      }
+
+      registerEventListeners();
+      await syncAllLayersRuntimeState();
+      await applyZoomGatingForTiles();
+      if (DEBUG_TILES) registerDebugOverlays();
+      scheduleRelativeLayerStacking(0);
+      setTimeout(() => scheduleRelativeLayerStacking(0), 400);
+      setTimeout(() => scheduleRelativeLayerStacking(0), 1200);
+
+      log(`Initialized (${LAYERS.length} layers, strict SDK mode).`);
+    } catch (error) {
+      log('Initialization failed:', error);
+    }
+  }
+
+  function bootstrapWithSdk() {
+    if (!UW.SDK_INITIALIZED || typeof UW.SDK_INITIALIZED.then !== 'function') {
+      log('window.SDK_INITIALIZED is unavailable, aborting.');
+      return;
+    }
+
+    UW.SDK_INITIALIZED
+      .then(() => {
+        try {
+          RUNTIME.sdk = ensureScriptSdk();
+        } catch (error) {
+          log('SDK is unavailable:', error);
+          return;
+        }
+
+        if (RUNTIME.sdk.State.isReady()) {
+          initializeScript();
+          return;
+        }
+
+        RUNTIME.sdk.Events.once({ eventName: 'wme-ready' })
+          .then(() => initializeScript())
+          .catch((error) => {
+            log('Failed while waiting for wme-ready:', error);
+          });
+      })
+      .catch((error) => {
+        log('SDK initialization promise rejected:', error);
+      });
+  }
+
+  bootstrapWithSdk();
 })();
