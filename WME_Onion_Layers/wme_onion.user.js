@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                                     WME Onion Layers
 // @name:pl                                     WME Cebula
-// @version                                      Beta.12
+// @version                                      Beta.14
 // @tag                                            WME
 // @description                 Adds custom SDK layers to WME (GeoJSON + raster tiles).
 // @description:pl              Dodaje niestandardowe warstwy SDK do WME (GeoJSON + raster tile).
@@ -65,7 +65,7 @@
 
   const PROXY_WMS_BASE         = 'https://proxy.labtool.pl/wms?url=';
   const PROXY_HOST             = 'proxy.labtool.pl';
-  const PROXY_REQUEST_DELAY_MS = 50;
+  const MAX_CONCURRENT_PROXY_REQUESTS = 4;
   const WEB_MERCATOR_HALF = 20037508.342789244;
 
   const DEFAULT_GEOJSON_STYLE = {
@@ -1302,11 +1302,14 @@
   }
 
   // ── Proxy tile queue ────────────────────────────────────────────────────────
-  // Intercepts img.src assignments for proxy.labtool.pl tiles, queues them
-  // with center-first sort and PROXY_REQUEST_DELAY_MS between each dispatch.
+  // Intercepts img.src assignments for proxy.labtool.pl tiles, queues them with
+  // center-first sort, and dispatches up to MAX_CONCURRENT_PROXY_REQUESTS at once.
+  // Concurrency (not a fixed delay) is the throttle: a slot frees the instant the
+  // browser resolves the image — near-instantly for a cache hit, after the real
+  // round-trip for a network fetch — so cached tiles never wait behind a timer.
 
   let _proxyQueue = [];
-  let _proxyTimer = null;
+  let _proxyActiveCount = 0;
 
   function _proxyDistSq(url) {
     try {
@@ -1342,23 +1345,46 @@
   }
 
   function _proxyFlush() {
-    _proxyTimer = null;
-    if (!_proxyQueue.length) return;
-    _proxyQueue.forEach(q => { q.dist = _proxyDistSq(q.url); });
-    _proxyQueue.sort((a, b) => a.dist - b.dist);
-    const next = _proxyQueue.shift();
-    next.fire();
-    if (_proxyQueue.length) {
-      _proxyTimer = setTimeout(_proxyFlush, PROXY_REQUEST_DELAY_MS);
+    while (_proxyActiveCount < MAX_CONCURRENT_PROXY_REQUESTS && _proxyQueue.length) {
+      _proxyQueue.forEach(q => { q.dist = _proxyDistSq(q.url); });
+      _proxyQueue.sort((a, b) => a.dist - b.dist);
+      _proxyDispatch(_proxyQueue.shift());
     }
   }
 
+  // Frees the concurrency slot held by img's current in-flight dispatch (if any) —
+  // called both when its load/error fires and when OL2 recycles the element by
+  // reassigning .src again before the previous request ever resolved.
+  function _proxyCancelActive(img) {
+    const settle = img.__proxySettle;
+    if (settle) settle();
+  }
+
+  function _proxyDispatch(entry) {
+    _proxyActiveCount++;
+    const img = entry.img;
+
+    const settle = () => {
+      if (img.__proxySettle !== settle) return;
+      img.__proxySettle = null;
+      img.removeEventListener('load', settle);
+      img.removeEventListener('error', settle);
+      _proxyActiveCount--;
+      _proxyFlush();
+    };
+
+    img.__proxySettle = settle;
+    img.addEventListener('load', settle, { once: true });
+    img.addEventListener('error', settle, { once: true });
+
+    entry.fire();
+  }
+
   function _proxyEnqueue(url, img, fire) {
+    _proxyCancelActive(img);
     _proxyQueue = _proxyQueue.filter(q => q.img !== img);
     _proxyQueue.push({ url, img, dist: _proxyDistSq(url), fire });
-    if (!_proxyTimer) {
-      _proxyTimer = setTimeout(_proxyFlush, 0);
-    }
+    _proxyFlush();
   }
 
   function installProxyImageQueue() {
@@ -1371,16 +1397,18 @@
     Object.defineProperty(proto, 'src', {
       get: desc.get,
       set(value) {
+        const img = this;
         if (typeof value === 'string' && value.includes(PROXY_HOST)) {
-          const img = this;
           _proxyEnqueue(value, img, () => nativeSet.call(img, value));
         } else {
-          nativeSet.call(this, value);
+          _proxyCancelActive(img);
+          _proxyQueue = _proxyQueue.filter(q => q.img !== img);
+          nativeSet.call(img, value);
         }
       },
       configurable: true,
     });
-    log('Proxy tile queue ready — delay:', PROXY_REQUEST_DELAY_MS, 'ms, center-first sort.');
+    log('Proxy tile queue ready — max concurrent:', MAX_CONCURRENT_PROXY_REQUESTS, ', center-first sort.');
   }
 
   installProxyImageQueue();
