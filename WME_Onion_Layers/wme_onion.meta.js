@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                                     WME Onion Layers
 // @name:pl                                     WME Cebula
-// @version                                      Beta.14
+// @version                                      Beta.16
 // @tag                                            WME
 // @description                 Adds custom SDK layers to WME (GeoJSON + raster tiles).
 // @description:pl              Dodaje niestandardowe warstwy SDK do WME (GeoJSON + raster tile).
@@ -12,6 +12,9 @@
 // @namespace         https://wazepolska.pl
 // @match             https://*.waze.com/editor*
 // @match             https://*.waze.com/*/editor*
+// @exclude           https://*.waze.com/user/editor*
+// @exclude           https://*.waze.com/*/user/editor*
+// @exclude           https://*.waze.com/editor/sdk/*
 // @supportURL        https://github.com/Falcon4Tech/WME/issues
 // @icon              https://polska.e-mapa.net/implementation/polska/images/icon.ico
 // @updateURL         https://raw.githubusercontent.com/Falcon4Tech/WME/main/WME_Onion_Layers/wme_onion.meta.js

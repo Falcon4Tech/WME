@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                                     WME Onion Layers
 // @name:pl                                     WME Cebula
-// @version                                      Beta.14
+// @version                                      Beta.16
 // @tag                                            WME
 // @description                 Adds custom SDK layers to WME (GeoJSON + raster tiles).
 // @description:pl              Dodaje niestandardowe warstwy SDK do WME (GeoJSON + raster tile).
@@ -12,35 +12,40 @@
 // @namespace         https://wazepolska.pl
 // @match             https://*.waze.com/editor*
 // @match             https://*.waze.com/*/editor*
+// @exclude           https://*.waze.com/user/editor*
+// @exclude           https://*.waze.com/*/user/editor*
+// @exclude           https://*.waze.com/editor/sdk/*
 // @supportURL        https://github.com/Falcon4Tech/WME/issues
 // @icon              https://polska.e-mapa.net/implementation/polska/images/icon.ico
 // @updateURL         https://raw.githubusercontent.com/Falcon4Tech/WME/main/WME_Onion_Layers/wme_onion.meta.js
 // @downloadURL       https://raw.githubusercontent.com/Falcon4Tech/WME/main/WME_Onion_Layers/wme_onion.user.js
 // ==/UserScript==
 
+/* eslint-disable no-multi-spaces */
+
 (function () {
   'use strict';
 
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
-  const SCRIPT_ID = 'WME_Onion_Layers';
+  const SCRIPT_ID   = 'WME_Onion_Layers';
   const SCRIPT_NAME = 'WME Cebula';
   const START_GUARD = '__WME_ONION_SDK_BOOTSTRAPPED__';
 
-  const STATE_KEY = SCRIPT_ID;
+  const STATE_KEY     = SCRIPT_ID;
   const STATE_VERSION = 2;
-  const DEBUG_TILES = false;
+  const DEBUG_TILES   = false;
 
-  const LAYER_NAME_PREFIX = 'onion.';
-  const CHECKBOX_NAME_PREFIX = '⫸ ';
-  const ROADS_LAYER_NAME = 'segments';
-  const ROW_BASE_LAYER_ID = 'row_live_base';
+  const LAYER_NAME_PREFIX     = 'onion.';
+  const CHECKBOX_NAME_PREFIX  = '⫸ ';
+  const ROADS_LAYER_NAME      = 'segments';
+  const ROW_BASE_LAYER_ID     = 'row_live_base';
   const GEOPORTAL_STANDARD_LAYER_ID = 'geoportal_orto_standard';
-  const GRANICE_LAYER_ID = 'granice';
-  const MIASTA_LAYER_ID = 'miasta';
-  const PRG_ULICE_LAYER_ID = 'prg-ulice';
+  const GRANICE_LAYER_ID    = 'granice';
+  const MIASTA_LAYER_ID     = 'miasta';
+  const PRG_ULICE_LAYER_ID  = 'prg-ulice';
   const PRG_ADRESY_LAYER_ID = 'prg-adresy';
-  const PRG_PLACE_LAYER_ID = 'prg-place';
+  const PRG_PLACE_LAYER_ID  = 'prg-place';
 
   // Basemaps should live below WME roads.
   const BASEMAP_LAYER_IDS = [
@@ -55,17 +60,18 @@
     MIASTA_LAYER_ID,
   ];
 
-  const ROW_TARGET_ZINDEX_FALLBACK = 2011;
-  const ROW_OFFSET_BELOW_ROADS = 49;
-  const OVERLAY_TARGET_ZINDEX_FALLBACK = 2200;
-  const OVERLAY_OFFSET_ABOVE_ROADS = 10;
-  const MAX_REASONABLE_ROADS_ZINDEX = 2150;
+  const ROW_TARGET_ZINDEX_FALLBACK      = 2011;
+  const ROW_OFFSET_BELOW_ROADS          = 49;
+  const OVERLAY_TARGET_ZINDEX_FALLBACK  = 2200;
+  const OVERLAY_OFFSET_ABOVE_ROADS      = 10;
+  const MAX_REASONABLE_ROADS_ZINDEX     = 2150;
 
-  const DATA_BASE_URL = `https://cdn.jsdelivr.net/gh/Falcon4Tech/WME@main/${SCRIPT_ID}/data`;
+  const DATA_BASE_URL     = `https://cdn.jsdelivr.net/gh/Falcon4Tech/WME@main/${SCRIPT_ID}/data`;
 
-  const PROXY_WMS_BASE         = 'https://proxy.labtool.pl/wms?url=';
-  const PROXY_HOST             = 'proxy.labtool.pl';
+  const PROXY_WMS_BASE    = 'https://proxy.labtool.pl/wms?url=';
+  const PROXY_HOST        = 'proxy.labtool.pl';
   const MAX_CONCURRENT_PROXY_REQUESTS = 4;
+  const SNAPPED_REFRESH_DEBOUNCE_MS = 575;
   const WEB_MERCATOR_HALF = 20037508.342789244;
 
   const DEFAULT_GEOJSON_STYLE = {
@@ -202,6 +208,7 @@
     state: null,
     stopEventListeners: [],
     zIndexSyncTimer: null,
+    snappedRefreshTimer: null,
   };
 
   function normalizeBooleanRecord(value) {
@@ -458,8 +465,6 @@
   }
 
   // During zoom animation WME may keep showing tiles from the previous zoom level.
-  // For noisy overlay layers (WMS-rendered tiles like borders/labels) this looks bad.
-  // Now, overlays are simply refreshed without debounce.
   function scheduleOverlayTileRefreshAfterZoom() {
     const zoomLevel = getCurrentZoomLevel();
 
@@ -487,8 +492,14 @@
       }
     }
 
-    // Reload snapped WMS layers — resolution changes per zoom level.
-    updateAllSnappedLayers();
+    // Reload snapped WMS layers
+    if (RUNTIME.snappedRefreshTimer !== null) {
+      clearTimeout(RUNTIME.snappedRefreshTimer);
+    }
+    RUNTIME.snappedRefreshTimer = setTimeout(() => {
+      RUNTIME.snappedRefreshTimer = null;
+      updateAllSnappedLayers();
+    }, SNAPPED_REFRESH_DEBOUNCE_MS);
   }
 
   function safeSetLayerCheckboxChecked(checkboxName, isChecked) {
@@ -1226,20 +1237,9 @@
       eventName: 'wme-map-move-end',
     }));
 
-    // Zoom change events (names vary across SDK builds; register a few common ones).
-    RUNTIME.stopEventListeners.push(RUNTIME.sdk.Events.on({
-      eventHandler: scheduleOverlayTileRefreshAfterZoom,
-      eventName: 'wme-zoom-changed',
-    }));
-
     RUNTIME.stopEventListeners.push(RUNTIME.sdk.Events.on({
       eventHandler: scheduleOverlayTileRefreshAfterZoom,
       eventName: 'wme-map-zoom-changed',
-    }));
-
-    RUNTIME.stopEventListeners.push(RUNTIME.sdk.Events.on({
-      eventHandler: scheduleOverlayTileRefreshAfterZoom,
-      eventName: 'wme-map-zoom-level-changed',
     }));
   }
 
@@ -1344,11 +1344,29 @@
     return 0;
   }
 
+  // Extracts the zoom level baked into a Geoportal Orto XYZ tile URL
+  // (onion/geoportal-orto-standard~z~x~y@size). Returns null for anything else
+  // (other tile layers, the WMS ?url= pattern) — those are left untouched.
+  function _proxyOrtoTileZoom(url) {
+    if (!url.includes('geoportal-orto-standard~')) return null;
+    const t = url.match(/~(\d+)~\d+~\d+@/);
+    return t ? +t[1] : null;
+  }
+
   function _proxyFlush() {
     while (_proxyActiveCount < MAX_CONCURRENT_PROXY_REQUESTS && _proxyQueue.length) {
       _proxyQueue.forEach(q => { q.dist = _proxyDistSq(q.url); });
       _proxyQueue.sort((a, b) => a.dist - b.dist);
-      _proxyDispatch(_proxyQueue.shift());
+      const next = _proxyQueue.shift();
+
+      // Orto only
+      const tileZoom = _proxyOrtoTileZoom(next.url);
+      if (tileZoom !== null) {
+        const currentZoom = getCurrentZoomLevel();
+        if (currentZoom !== null && tileZoom !== currentZoom) continue;
+      }
+
+      _proxyDispatch(next);
     }
   }
 
