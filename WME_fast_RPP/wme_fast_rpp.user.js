@@ -1,16 +1,17 @@
 // ==UserScript==
 // @name                WME fast RPP
-// @version             0.6.2
+// @version             0.6.8
 // @tag                 WME
 // @description         Fast residential point place (RPP) insertion with smart house number incrementing.
 // @description:pl      Szybkie wstawianie RPP z inteligentną inkrementacją numerów domów.
-// @author              Falcon4Tech
+// @author              FalconTech
 // @run-at              document-idle
 // @namespace           https://wazepolska.pl
 // @match               https://*.waze.com/editor*
 // @match               https://*.waze.com/*/editor*
 // @exclude             https://*.waze.com/user/editor*
 // @exclude             https://*.waze.com/*/user/editor*
+// @exclude             https://*.waze.com/editor/sdk/*
 // @grant               none
 // @supportURL          https://github.com/Falcon4Tech/WME/issues
 // @updateURL           https://raw.githubusercontent.com/Falcon4Tech/WME/main/WME_fast_RPP/wme_fast_rpp.meta.js
@@ -49,6 +50,7 @@
   let placementMode = 'RPP'; // 'RPP' | 'HN'
   let hnActive      = false;
   let hnAutoConfirm = true;
+  let numberStep    = 1; // 1 or 2 — "Krok +2" toggle, for odd/even-only street sides
   const hnUnsubList = [];
 
   /** @type {string[]} */
@@ -76,7 +78,7 @@
   function autoAdvance(nr) {
     const { num, letter } = parseHouseNumber(nr);
     if (num === null) return nr;
-    if (!letter) return String(num + 1);
+    if (!letter) return String(num + numberStep);
     return String(num) + String.fromCharCode(letter.charCodeAt(0) + 1);
   }
 
@@ -178,7 +180,7 @@
   }
 
   // ── UI refs ────────────────────────────────────────────────────────────
-  let elCity, elStreet, elNr;
+  let elCity, elStreet, elNr, elStep2;
   let elRppFields, elHnExtra, elHnAutoConfirm, elInstSection;
   let elNumRow, elLetRow;
   let elModeBtn, elSave, elStatus, elHistoryList;
@@ -198,8 +200,9 @@
     const start = Math.max(1, num - 3);
     for (let i = 0; i < NUM_ROW_SIZE; i++) {
       const n = start + i;
+      const skipped = numberStep === 2 && (n % 2) !== (num % 2);
       const btn = document.createElement('button');
-      btn.className = 'rpp-row-btn' + (n === num ? ' active' : '');
+      btn.className = 'rpp-row-btn' + (n === num ? ' active' : '') + (skipped ? ' skipped' : '');
       btn.textContent = String(n);
       btn.addEventListener('click', () => {
         if (elNr) { elNr.value = String(n); updateRows(); }
@@ -259,11 +262,12 @@
       #rpp-panel select:focus { outline: none; border-color: #2196f3; }
       #rpp-nr-row { display: flex; gap: 6px; align-items: center; margin-bottom: 5px; }
       #rpp-nr { width: 70px !important; }
-      #rpp-skip {
+      #rpp-step2 {
         padding: 4px 8px; border: 1px solid #bbb; border-radius: 3px;
-        cursor: pointer; background: #f5f5f5; font-size: 12px; white-space: nowrap;
+        cursor: pointer; background: #f5f5f5; font-size: 12px; font-weight: 600; white-space: nowrap;
       }
-      #rpp-skip:hover { background: #e0e0e0; }
+      #rpp-step2:hover { background: #e0e0e0; }
+      #rpp-step2.active { background: #2196f3; color: #fff; border-color: #1565c0; }
       #rpp-num-row, #rpp-let-row { display: flex; gap: 3px; margin-bottom: 3px; }
       .rpp-row-btn {
         padding: 4px 0; border: 1px solid #ddd; border-radius: 3px;
@@ -272,6 +276,7 @@
       }
       .rpp-row-btn:hover { background: #ddeeff; border-color: #2196f3; }
       .rpp-row-btn.active { background: #2196f3; color: #fff; border-color: #1565c0; }
+      .rpp-row-btn.skipped { color: #bbb; background: #fafafa; border-color: #eee; }
       #rpp-mode-btn {
         display: block; width: 100%; margin-top: 8px; padding: 8px;
         border: none; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 700;
@@ -337,7 +342,7 @@
       <label>Numer domu</label>
       <div id="rpp-nr-row">
         <input type="text" id="rpp-nr" placeholder="np. 5" />
-        <button id="rpp-skip">→ skip</button>
+        <button id="rpp-step2">Krok +2</button>
       </div>
       <div id="rpp-num-row"></div>
       <div id="rpp-let-row"></div>
@@ -380,6 +385,7 @@
     elCity          = div.querySelector('#rpp-city');
     elStreet        = div.querySelector('#rpp-street');
     elNr            = div.querySelector('#rpp-nr');
+    elStep2         = div.querySelector('#rpp-step2');
     elRppFields     = div.querySelector('#rpp-rpp-fields');
     elHnExtra       = div.querySelector('#rpp-hn-extra');
     elHnAutoConfirm = div.querySelector('#rpp-hn-autoconfirm');
@@ -391,9 +397,11 @@
     elStatus        = div.querySelector('#rpp-status');
     elHistoryList   = div.querySelector('#rpp-history');
 
-    div.querySelector('#rpp-skip').addEventListener('click', () => {
-      const { num } = parseHouseNumber(elNr?.value || '');
-      if (num !== null && elNr) { elNr.value = String(num + 1); updateRows(); }
+    elStep2.addEventListener('click', () => {
+      numberStep = numberStep === 2 ? 1 : 2;
+      elStep2.classList.toggle('active', numberStep === 2);
+      persistPrefs();
+      updateRows();
     });
 
     div.querySelectorAll('.rpp-mode-tab').forEach(btn => {
@@ -459,12 +467,6 @@
         return ok;
       });
 
-      // Always keep the saved city in the list regardless of viewport
-      if (saved && !inView.has(saved)) {
-        const savedCity = all.find(c => c.name === saved);
-        if (savedCity) visible.push(savedCity);
-      }
-
       visible
         .sort((a, b) => a.name.localeCompare(b.name, 'pl'))
         .forEach(c => {
@@ -473,7 +475,16 @@
           opt.textContent = c.name;
           elCity.appendChild(opt);
         });
+
+      // Always keep saved city visible — even if WME unloaded that area's data
       elCity.value = saved || topCity?.name || '';
+      if (saved && elCity.value !== saved) {
+        const opt = document.createElement('option');
+        opt.value = saved;
+        opt.textContent = saved;
+        elCity.appendChild(opt);
+        elCity.value = saved;
+      }
     } catch (_) {}
   }
 
@@ -543,6 +554,10 @@
       hnAutoConfirm = prefs.hnAutoConfirm;
       if (elHnAutoConfirm) elHnAutoConfirm.checked = hnAutoConfirm;
     }
+    if (prefs.numberStep === 2) {
+      numberStep = 2;
+      if (elStep2) elStep2.classList.add('active');
+    }
     if (prefs.placementMode) switchPlacementMode(prefs.placementMode);
   }
 
@@ -553,6 +568,7 @@
       lastNumber:    elNr?.value.trim()     || '',
       placementMode,
       hnAutoConfirm,
+      numberStep,
     });
   }
 
