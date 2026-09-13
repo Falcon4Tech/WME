@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                                     WME Onion Layers
 // @name:pl                                     WME Cebula
-// @version                                      Beta.17
+// @version                                       1.0.0
 // @tag                                            WME
 // @description                 Adds custom SDK layers to WME (GeoJSON + raster tiles).
 // @description:pl              Dodaje niestandardowe warstwy SDK do WME (GeoJSON + raster tile).

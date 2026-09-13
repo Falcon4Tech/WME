@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name                                     WME Onion Layers
 // @name:pl                                     WME Cebula
-// @version                                      Beta.17
+// @version                                       1.0.0
 // @tag                                            WME
 // @description                 Adds custom SDK layers to WME (GeoJSON + raster tiles).
 // @description:pl              Dodaje niestandardowe warstwy SDK do WME (GeoJSON + raster tile).
@@ -148,6 +148,30 @@
       servers: ['https://proxy.labtool.pl'],
       fileName: 'onion/kieg-dzialki~${z}~${x}~${y}@1024.png',
       minZoom: 15,
+      params: {},
+    },
+    {
+      id: 'bdot',
+      type: 'tile',
+      name: 'Obiekty topograficzne',
+      defaultOn: false,
+      tileWidth: 1024,
+      tileHeight: 1024,
+      servers: ['https://proxy.labtool.pl'],
+      fileName: 'onion/bdot~${z}~${x}~${y}@1024.png',
+      minZoom: 16,
+      params: {},
+    },
+    {
+      id: 'stacje-ladowania',
+      type: 'tile',
+      name: 'Stacje ładowania',
+      defaultOn: false,
+      tileWidth: 1024,
+      tileHeight: 1024,
+      servers: ['https://proxy.labtool.pl'],
+      fileName: 'onion/stacje-ladowania~${z}~${x}~${y}@1024.png',
+      minZoom: 16,
       params: {},
     },
     {
